@@ -1,0 +1,51 @@
+name: rolling
+permissions:
+  contents: read
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  RUST_BACKTRACE: short
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  nightly-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # tag=v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
+        with: { toolchain: nightly }
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # tag=v2.9.4
+        with: { tool: just }
+      - run: just test
+
+  latest-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # tag=v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
+        with: { toolchain: stable }
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # tag=v2.9.4
+        with: { tool: just }
+      - run: just test-latest-deps
+
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # tag=v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
+        with: { toolchain: stable }
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # tag=v2.9.4
+        with: { tool: "just,cargo-deny" }
+      - run: just deny-advisories
