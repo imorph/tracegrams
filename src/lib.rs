@@ -10,7 +10,7 @@ mod init;
 mod matrix;
 mod recorder;
 
-pub use context::{ManualCtx, Outcome};
+pub use context::{Ctx, ManualCtx, Outcome};
 pub use init::{InitError, MemoryEstimate, StageId, Tracegrams, TracegramsBuilder};
 
 #[doc(hidden)]

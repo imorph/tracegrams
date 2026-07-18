@@ -1,6 +1,11 @@
 //! Fixed shared recorder storage and checkpoint counter primitives.
 
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::bucket::{CALIBRATION_BUCKETS, calibration_bounds, default_bounds};
 use crate::init::{MemoryEstimate, RegistryCookie};
@@ -205,6 +210,11 @@ pub(crate) struct Inner {
     pub(crate) calibration_bounds: Box<[u64]>,
     pub(crate) calibration_state: AtomicU8,
     pub(crate) calibration_epoch: AtomicU16,
+    pub(crate) clock_epoch: Instant,
+    #[cfg(test)]
+    pub(crate) clock_readings: Mutex<VecDeque<(u64, bool)>>,
+    #[cfg(test)]
+    pub(crate) clock_reads: AtomicU64,
 }
 
 impl Inner {
@@ -231,6 +241,11 @@ impl Inner {
             calibration_bounds: calibration_bounds().to_vec().into_boxed_slice(),
             calibration_state: AtomicU8::new(0),
             calibration_epoch: AtomicU16::new(0),
+            clock_epoch: Instant::now(),
+            #[cfg(test)]
+            clock_readings: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            clock_reads: AtomicU64::new(0),
         }
     }
 

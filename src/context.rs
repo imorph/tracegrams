@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bucket::bucketize;
 use crate::init::{RegistryCookie, StageId, Tracegrams};
@@ -22,6 +22,135 @@ pub enum Outcome {
 struct PreviousMark {
     stage: u8,
     cumulative_bucket: u8,
+}
+
+const COOKIE_MASK: u64 = 0xffff_ffff;
+const CALIBRATION_EPOCH_SHIFT: u32 = 32;
+const PREVIOUS_STAGE_SHIFT: u32 = 48;
+const PREVIOUS_BUCKET_SHIFT: u32 = 54;
+const PREVIOUS_FIELD_MASK: u64 = 0x3f;
+const HAS_PREVIOUS_BIT: u64 = 1 << 60;
+const IDENTITY_MASK: u64 = (1 << PREVIOUS_STAGE_SHIFT) - 1;
+
+/// Clock-reading state for one linear request path.
+///
+/// A context is tied to the recorder that created it. It is neither cloneable
+/// nor convertible to [`ManualCtx`]. Moving it transfers its single logical
+/// ownership, including across threads.
+///
+/// `Ctx` is intentionally not [`Clone`]:
+///
+/// ```compile_fail
+/// use tracegrams::Tracegrams;
+///
+/// let mut builder = Tracegrams::builder();
+/// builder.stage("only").unwrap();
+/// let tracegrams = builder.build().unwrap();
+/// let context = tracegrams.start();
+/// let _duplicate = context.clone();
+/// ```
+///
+/// Nor is it [`Copy`]:
+///
+/// ```compile_fail
+/// use tracegrams::Tracegrams;
+///
+/// let mut builder = Tracegrams::builder();
+/// builder.stage("only").unwrap();
+/// let tracegrams = builder.build().unwrap();
+/// let context = tracegrams.start();
+/// let _moved = context;
+/// let _used_again = context;
+/// ```
+pub struct Ctx {
+    last_timestamp_ns: u64,
+    cumulative_ns: u64,
+    metadata: u64,
+}
+
+impl Ctx {
+    fn new(last_timestamp_ns: u64, cookie: RegistryCookie, calibration_epoch: u16) -> Self {
+        Self {
+            last_timestamp_ns,
+            cumulative_ns: 0,
+            metadata: u64::from(cookie.raw())
+                | (u64::from(calibration_epoch) << CALIBRATION_EPOCH_SHIFT),
+        }
+    }
+
+    const fn registry_cookie(&self) -> u64 {
+        self.metadata & COOKIE_MASK
+    }
+
+    const fn calibration_epoch(&self) -> u16 {
+        #[allow(clippy::cast_possible_truncation)]
+        let epoch = (self.metadata >> CALIBRATION_EPOCH_SHIFT) as u16;
+        epoch
+    }
+
+    const fn previous(&self) -> Option<PreviousMark> {
+        if self.metadata & HAS_PREVIOUS_BIT == 0 {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let stage = ((self.metadata >> PREVIOUS_STAGE_SHIFT) & PREVIOUS_FIELD_MASK) as u8;
+        #[allow(clippy::cast_possible_truncation)]
+        let cumulative_bucket =
+            ((self.metadata >> PREVIOUS_BUCKET_SHIFT) & PREVIOUS_FIELD_MASK) as u8;
+        Some(PreviousMark {
+            stage,
+            cumulative_bucket,
+        })
+    }
+
+    fn set_previous(&mut self, previous: PreviousMark) {
+        self.metadata = (self.metadata & IDENTITY_MASK)
+            | (u64::from(previous.stage) << PREVIOUS_STAGE_SHIFT)
+            | (u64::from(previous.cumulative_bucket) << PREVIOUS_BUCKET_SHIFT)
+            | HAS_PREVIOUS_BIT;
+    }
+}
+
+impl fmt::Debug for Ctx {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Ctx")
+            .field("last_timestamp_ns", &self.last_timestamp_ns)
+            .field("cumulative_ns", &self.cumulative_ns)
+            .field("calibration_epoch", &self.calibration_epoch())
+            .field(
+                "previous_stage",
+                &self.previous().map(|previous| previous.stage),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClockReading {
+    timestamp_ns: u64,
+    overflowed: bool,
+}
+
+impl ClockReading {
+    fn from_elapsed(elapsed: Duration) -> Self {
+        match u64::try_from(elapsed.as_nanos()) {
+            Ok(timestamp_ns) => Self {
+                timestamp_ns,
+                overflowed: false,
+            },
+            Err(_) => Self {
+                timestamp_ns: u64::MAX,
+                overflowed: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MarkAdvance {
+    cumulative_ns: u64,
+    previous: PreviousMark,
 }
 
 /// Caller-timed state for one linear request path.
@@ -50,6 +179,28 @@ impl fmt::Debug for ManualCtx {
 }
 
 impl Tracegrams {
+    /// Starts a wall-clock-timed request with one clock read.
+    pub fn start(&self) -> Ctx {
+        let reading = self.read_clock();
+        Ctx::new(
+            reading.timestamp_ns,
+            self.inner.cookie,
+            self.inner.calibration_epoch.load(Ordering::Acquire),
+        )
+    }
+
+    /// Records one wall-clock interval ending at `stage`.
+    pub fn mark(&self, context: &mut Ctx, stage: StageId) {
+        let reading = self.read_clock();
+        self.record_clocked_mark(context, stage, reading, None);
+    }
+
+    /// Records the final wall-clock interval and outcome, consuming the context.
+    pub fn finish(&self, mut context: Ctx, stage: StageId, outcome: Outcome) {
+        let reading = self.read_clock();
+        self.record_clocked_mark(&mut context, stage, reading, Some(outcome));
+    }
+
     /// Starts a caller-timed request without reading the clock.
     pub fn start_manual(&self) -> ManualCtx {
         ManualCtx {
@@ -76,9 +227,67 @@ impl Tracegrams {
         self.record_manual_mark(&mut context, stage, elapsed, Some(outcome));
     }
 
-    // Keep the ordered atomic update sequence together: context advancement
-    // must remain visibly last.
-    #[allow(clippy::too_many_lines)]
+    fn read_clock(&self) -> ClockReading {
+        #[cfg(test)]
+        {
+            self.inner.clock_reads.fetch_add(1, Ordering::Relaxed);
+            if let Some((timestamp_ns, overflowed)) = self
+                .inner
+                .clock_readings
+                .lock()
+                .expect("test clock mutex must not be poisoned")
+                .pop_front()
+            {
+                return ClockReading {
+                    timestamp_ns,
+                    overflowed,
+                };
+            }
+        }
+
+        let now = Instant::now();
+        let elapsed = now
+            .checked_duration_since(self.inner.clock_epoch)
+            .unwrap_or(Duration::ZERO);
+        ClockReading::from_elapsed(elapsed)
+    }
+
+    fn record_clocked_mark(
+        &self,
+        context: &mut Ctx,
+        stage: StageId,
+        reading: ClockReading,
+        outcome: Option<Outcome>,
+    ) {
+        let previous = context.previous();
+        if !self.validate_mark(context.registry_cookie(), previous, stage) {
+            return;
+        }
+        let Some(measured_ns) = reading.timestamp_ns.checked_sub(context.last_timestamp_ns) else {
+            self.inner
+                .increment_diagnostic(DiagnosticCounter::ClockRegressions);
+            return;
+        };
+        let (local_ns, latency_overflowed) = if reading.overflowed {
+            (u64::MAX, true)
+        } else {
+            (measured_ns, false)
+        };
+        let advance = self.record_valid_mark(
+            context.cumulative_ns,
+            previous,
+            stage,
+            local_ns,
+            latency_overflowed,
+            outcome,
+        );
+
+        // Every shared update above precedes advancement of request-local state.
+        context.last_timestamp_ns = reading.timestamp_ns;
+        context.cumulative_ns = advance.cumulative_ns;
+        context.set_previous(advance.previous);
+    }
+
     fn record_manual_mark(
         &self,
         context: &mut ManualCtx,
@@ -86,33 +295,68 @@ impl Tracegrams {
         elapsed: Duration,
         outcome: Option<Outcome>,
     ) {
-        if context.cookie != self.inner.cookie {
+        if !self.validate_mark(u64::from(context.cookie.raw()), context.previous, stage) {
+            return;
+        }
+        let (local_ns, latency_overflowed) = match u64::try_from(elapsed.as_nanos()) {
+            Ok(value) => (value, false),
+            Err(_) => (u64::MAX, true),
+        };
+        let advance = self.record_valid_mark(
+            context.cumulative_ns,
+            context.previous,
+            stage,
+            local_ns,
+            latency_overflowed,
+            outcome,
+        );
+
+        // Every shared update above precedes advancement of request-local state.
+        context.cumulative_ns = advance.cumulative_ns;
+        context.previous = Some(advance.previous);
+    }
+
+    fn validate_mark(
+        &self,
+        context_cookie: u64,
+        previous: Option<PreviousMark>,
+        stage: StageId,
+    ) -> bool {
+        if context_cookie != u64::from(self.inner.cookie.raw()) {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::InvalidContextMarks);
-            return;
+            return false;
         }
         if stage.cookie() != self.inner.cookie {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::InvalidStageMarks);
-            return;
+            return false;
         }
-        if context
-            .previous
-            .is_some_and(|previous| stage.index() <= usize::from(previous.stage))
-        {
+        if previous.is_some_and(|previous| stage.index() <= usize::from(previous.stage)) {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::NonMonotonicMarks);
-            return;
+            return false;
         }
+        true
+    }
 
-        let local_ns = if let Ok(value) = u64::try_from(elapsed.as_nanos()) {
-            value
-        } else {
+    // Keep the ordered atomic update sequence together: context advancement
+    // must remain visibly outside and last in each caller.
+    #[allow(clippy::too_many_lines)]
+    fn record_valid_mark(
+        &self,
+        previous_cumulative_ns: u64,
+        previous: Option<PreviousMark>,
+        stage: StageId,
+        local_ns: u64,
+        latency_overflowed: bool,
+        outcome: Option<Outcome>,
+    ) -> MarkAdvance {
+        if latency_overflowed {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::LatencyOverflows);
-            u64::MAX
-        };
-        let cumulative_ns = if let Some(value) = context.cumulative_ns.checked_add(local_ns) {
+        }
+        let cumulative_ns = if let Some(value) = previous_cumulative_ns.checked_add(local_ns) {
             value
         } else {
             self.inner
@@ -133,7 +377,7 @@ impl Tracegrams {
             self.inner.increment(index);
         }
 
-        if let Some(previous) = context.previous {
+        if let Some(previous) = previous {
             let previous_bucket = usize::from(previous.cumulative_bucket);
             if let Some(index) =
                 self.inner
@@ -167,9 +411,9 @@ impl Tracegrams {
         ) {
             self.inner.increment(index);
         }
-        if context.previous.is_some() {
+        if previous.is_some() {
             let calibration_previous =
-                bucketize(context.cumulative_ns, &self.inner.calibration_bounds);
+                bucketize(previous_cumulative_ns, &self.inner.calibration_bounds);
             if let Some(index) = self.inner.layout.calibration(
                 stage.index(),
                 CalibrationDistribution::PreviousCumulative,
@@ -189,20 +433,22 @@ impl Tracegrams {
             }
         }
 
-        // Every shared update above precedes advancement of request-local state.
-        context.cumulative_ns = cumulative_ns;
-        context.previous = Some(PreviousMark {
-            // Registry construction bounds stage indices to 0..=63.
-            #[allow(clippy::cast_possible_truncation)]
-            stage: stage.index() as u8,
-            #[allow(clippy::cast_possible_truncation)]
-            cumulative_bucket: cumulative_bucket as u8,
-        });
+        MarkAdvance {
+            cumulative_ns,
+            previous: PreviousMark {
+                // Registry construction bounds stage indices to 0..=63.
+                #[allow(clippy::cast_possible_truncation)]
+                stage: stage.index() as u8,
+                #[allow(clippy::cast_possible_truncation)]
+                cumulative_bucket: cumulative_bucket as u8,
+            },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
     use std::sync::atomic::Ordering;
 
     use super::*;
@@ -240,6 +486,40 @@ mod tests {
             context.calibration_epoch,
             context.previous,
         )
+    }
+
+    fn clocked_context_state(context: &Ctx) -> (u64, u64, u64) {
+        (
+            context.last_timestamp_ns,
+            context.cumulative_ns,
+            context.metadata,
+        )
+    }
+
+    fn install_test_clock(tracegrams: &Tracegrams, readings: &[(u64, bool)]) {
+        tracegrams.inner.clock_reads.store(0, Ordering::Relaxed);
+        let mut queued = tracegrams
+            .inner
+            .clock_readings
+            .lock()
+            .expect("test clock mutex must not be poisoned");
+        queued.clear();
+        queued.extend(readings.iter().copied());
+    }
+
+    fn assert_test_clock_consumed(tracegrams: &Tracegrams, expected_reads: u64) {
+        assert_eq!(
+            tracegrams.inner.clock_reads.load(Ordering::Relaxed),
+            expected_reads
+        );
+        assert!(
+            tracegrams
+                .inner
+                .clock_readings
+                .lock()
+                .expect("test clock mutex must not be poisoned")
+                .is_empty()
+        );
     }
 
     fn assert_only_diagnostic_changed(
@@ -310,6 +590,202 @@ mod tests {
 
         context.cumulative_ns = cumulative_ns;
         context.previous_cumulative_bucket = Some(cumulative_bucket);
+    }
+
+    #[test]
+    fn packed_clocked_metadata_preserves_every_field() {
+        let (tracegrams, _, _) = two_stage_recorder();
+        tracegrams
+            .inner
+            .calibration_epoch
+            .store(u16::MAX, Ordering::Release);
+        install_test_clock(&tracegrams, &[(u64::MAX, false)]);
+        let mut context = tracegrams.start();
+
+        context.set_previous(PreviousMark {
+            stage: 63,
+            cumulative_bucket: 63,
+        });
+
+        assert_eq!(size_of::<Ctx>(), 3 * size_of::<u64>());
+        assert_eq!(
+            context.registry_cookie(),
+            u64::from(tracegrams.inner.cookie.raw())
+        );
+        assert_eq!(context.calibration_epoch(), u16::MAX);
+        assert_eq!(
+            context.previous(),
+            Some(PreviousMark {
+                stage: 63,
+                cumulative_bucket: 63,
+            })
+        );
+        assert_eq!(context.last_timestamp_ns, u64::MAX);
+        assert_test_clock_consumed(&tracegrams, 1);
+    }
+
+    #[test]
+    fn deterministic_clocked_recording_matches_manual_after_moving_threads() {
+        let (clocked, clocked_first, clocked_second) = two_stage_recorder();
+        install_test_clock(&clocked, &[(1_000, false), (1_100, false), (1_300, false)]);
+
+        let context = clocked.start();
+        let worker_tracegrams = clocked.clone();
+        std::thread::spawn(move || {
+            let mut context = context;
+            worker_tracegrams.mark(&mut context, clocked_first);
+            worker_tracegrams.finish(context, clocked_second, Outcome::Success);
+        })
+        .join()
+        .unwrap();
+
+        let (manual, manual_first, manual_second) = two_stage_recorder();
+        let mut context = manual.start_manual();
+        manual.record_elapsed(&mut context, manual_first, Duration::from_nanos(100));
+        manual.finish_manual(
+            context,
+            manual_second,
+            Duration::from_nanos(200),
+            Outcome::Success,
+        );
+
+        assert_eq!(raw_counters(&clocked), raw_counters(&manual));
+        assert_test_clock_consumed(&clocked, 3);
+    }
+
+    #[test]
+    fn clocked_marks_reuse_context_stage_and_order_validation() {
+        let (tracegrams, first, second) = two_stage_recorder();
+        let (foreign, foreign_first, _) = two_stage_recorder();
+        install_test_clock(
+            &tracegrams,
+            &[
+                (100, false),
+                (200, false),
+                (300, false),
+                (400, false),
+                (500, false),
+            ],
+        );
+        install_test_clock(&foreign, &[(50, false)]);
+        let mut context = tracegrams.start();
+
+        let before_context = clocked_context_state(&context);
+        let before_counters = raw_counters(&tracegrams);
+        tracegrams.mark(&mut context, foreign_first);
+        assert_eq!(clocked_context_state(&context), before_context);
+        assert_only_diagnostic_changed(
+            &tracegrams,
+            &before_counters,
+            DiagnosticCounter::InvalidStageMarks,
+        );
+
+        tracegrams.mark(&mut context, second);
+        let before_context = clocked_context_state(&context);
+        let before_counters = raw_counters(&tracegrams);
+        tracegrams.mark(&mut context, first);
+        assert_eq!(clocked_context_state(&context), before_context);
+        assert_only_diagnostic_changed(
+            &tracegrams,
+            &before_counters,
+            DiagnosticCounter::NonMonotonicMarks,
+        );
+
+        let mut foreign_context = foreign.start();
+        let before_context = clocked_context_state(&foreign_context);
+        let before_counters = raw_counters(&tracegrams);
+        tracegrams.mark(&mut foreign_context, first);
+        assert_eq!(clocked_context_state(&foreign_context), before_context);
+        assert_only_diagnostic_changed(
+            &tracegrams,
+            &before_counters,
+            DiagnosticCounter::InvalidContextMarks,
+        );
+        assert_test_clock_consumed(&tracegrams, 5);
+        assert_test_clock_consumed(&foreign, 1);
+    }
+
+    #[test]
+    fn clock_regression_changes_only_its_diagnostic_counter() {
+        let (tracegrams, first, second) = two_stage_recorder();
+        install_test_clock(&tracegrams, &[(100, false), (200, false), (150, false)]);
+        let mut context = tracegrams.start();
+        tracegrams.mark(&mut context, first);
+        let before_context = clocked_context_state(&context);
+        let before_counters = raw_counters(&tracegrams);
+
+        tracegrams.mark(&mut context, second);
+
+        assert_eq!(clocked_context_state(&context), before_context);
+        assert_only_diagnostic_changed(
+            &tracegrams,
+            &before_counters,
+            DiagnosticCounter::ClockRegressions,
+        );
+        assert_test_clock_consumed(&tracegrams, 3);
+    }
+
+    #[test]
+    fn clock_timestamp_and_cumulative_overflow_are_total() {
+        let (tracegrams, first, second) = two_stage_recorder();
+        install_test_clock(
+            &tracegrams,
+            &[(0, false), (u64::MAX, false), (u64::MAX, true)],
+        );
+        let mut context = tracegrams.start();
+        tracegrams.mark(&mut context, first);
+        tracegrams.finish(context, second, Outcome::Error);
+
+        assert_eq!(
+            count(
+                &tracegrams,
+                tracegrams
+                    .inner
+                    .layout
+                    .local(second.index(), BUCKETS - 1)
+                    .unwrap(),
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &tracegrams,
+                tracegrams
+                    .inner
+                    .layout
+                    .diagnostic(DiagnosticCounter::LatencyOverflows),
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &tracegrams,
+                tracegrams
+                    .inner
+                    .layout
+                    .diagnostic(DiagnosticCounter::CumulativeOverflows),
+            ),
+            1
+        );
+        assert_test_clock_consumed(&tracegrams, 3);
+    }
+
+    #[test]
+    fn clock_normalization_checks_the_full_duration_range() {
+        assert_eq!(
+            ClockReading::from_elapsed(Duration::from_nanos(u64::MAX)),
+            ClockReading {
+                timestamp_ns: u64::MAX,
+                overflowed: false,
+            }
+        );
+        assert_eq!(
+            ClockReading::from_elapsed(Duration::new(u64::MAX, 999_999_999)),
+            ClockReading {
+                timestamp_ns: u64::MAX,
+                overflowed: true,
+            }
+        );
     }
 
     #[test]

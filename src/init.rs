@@ -30,6 +30,12 @@ pub struct StageId {
     index: u8,
 }
 
+impl RegistryCookie {
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 impl StageId {
     pub(crate) const fn cookie(self) -> RegistryCookie {
         self.cookie
