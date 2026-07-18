@@ -37,6 +37,10 @@ impl RegistryCookie {
 }
 
 impl StageId {
+    pub(crate) const fn new(cookie: RegistryCookie, index: u8) -> Self {
+        Self { cookie, index }
+    }
+
     pub(crate) const fn cookie(self) -> RegistryCookie {
         self.cookie
     }

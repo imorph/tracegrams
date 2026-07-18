@@ -13,7 +13,7 @@ use crate::matrix::StorageLayout;
 
 const CALIBRATION_DISTRIBUTIONS_PER_STAGE: usize = 3;
 // F×(Tl,Ta) = 4 + P×(Tp,Tl,Ta) = 8 disjoint truth-table cells (§5).
-const ONLINE_COUNTERS_PER_STAGE: usize = 12;
+pub(crate) const ONLINE_COUNTERS_PER_STAGE: usize = 12;
 const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
 const DIAGNOSTIC_COUNTERS: usize = 10;
 
@@ -125,6 +125,10 @@ impl FixedStorageLayout {
         self.online_count
     }
 
+    pub(crate) const fn online_start(self) -> usize {
+        self.online_start
+    }
+
     pub(crate) const fn completion_counter_count(self) -> usize {
         self.completion_count
     }
@@ -181,6 +185,15 @@ impl FixedStorageLayout {
                     .checked_mul(CALIBRATION_BUCKETS)?,
             )?
             .checked_add(bucket)
+    }
+
+    pub(crate) fn online(self, stage: usize, counter: usize) -> Option<usize> {
+        if stage >= self.stage_count || counter >= ONLINE_COUNTERS_PER_STAGE {
+            return None;
+        }
+        self.online_start
+            .checked_add(stage.checked_mul(ONLINE_COUNTERS_PER_STAGE)?)?
+            .checked_add(counter)
     }
 
     pub(crate) fn completion(self, stage: usize, error: bool) -> Option<usize> {
