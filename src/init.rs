@@ -186,7 +186,7 @@ impl TracegramsBuilder {
         if name.is_empty() {
             return Err(InitError::EmptyStageName);
         }
-        if self.stage_names.len() == MAX_STAGES {
+        if self.stage_names.len() >= MAX_STAGES {
             return Err(InitError::TooManyStages {
                 maximum: MAX_STAGES,
             });
@@ -201,7 +201,9 @@ impl TracegramsBuilder {
             });
         }
 
-        let index = u8::try_from(self.stage_names.len()).map_err(|_| InitError::SizeOverflow)?;
+        // The stage-count guard above bounds this value to 0..=63.
+        #[allow(clippy::cast_possible_truncation)]
+        let index = self.stage_names.len() as u8;
         self.stage_names.push(Box::from(name));
         Ok(StageId { cookie, index })
     }
@@ -304,7 +306,9 @@ fn claim_registry_cookie(source: &AtomicU64) -> Option<RegistryCookie> {
         if current > MAX_REGISTRY_COOKIE {
             return None;
         }
-        let cookie = u32::try_from(current).ok()?;
+        // The exhaustion guard above bounds this value to `u32`.
+        #[allow(clippy::cast_possible_truncation)]
+        let cookie = current as u32;
         match source.compare_exchange_weak(
             current,
             current + 1,
@@ -322,7 +326,9 @@ fn estimate_memory(
     stage_name_lengths: impl IntoIterator<Item = usize>,
 ) -> Result<MemoryEstimate, InitError> {
     let counter_bytes = size_of::<AtomicU64>();
-    let matrix_bytes = checked_bytes(layout.matrix_counter_count(), counter_bytes)?;
+    let matrix_bytes = layout
+        .matrix_counter_bytes()
+        .ok_or(InitError::SizeOverflow)?;
     let calibration_bytes = checked_bytes(layout.calibration_counter_count(), counter_bytes)?;
     let online_bytes = checked_bytes(layout.online_counter_count(), counter_bytes)?;
     let completion_bytes = checked_bytes(layout.completion_counter_count(), counter_bytes)?;

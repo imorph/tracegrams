@@ -7,6 +7,7 @@ use crate::init::{MemoryEstimate, RegistryCookie};
 use crate::matrix::StorageLayout;
 
 const CALIBRATION_DISTRIBUTIONS_PER_STAGE: usize = 3;
+// F×(Tl,Ta) = 4 + P×(Tp,Tl,Ta) = 8 disjoint truth-table cells (§5).
 const ONLINE_COUNTERS_PER_STAGE: usize = 12;
 const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
 const DIAGNOSTIC_COUNTERS: usize = 10;
@@ -57,8 +58,8 @@ impl FixedStorageLayout {
         self.stage_count
     }
 
-    pub(crate) const fn matrix_counter_count(self) -> usize {
-        self.calibration_start
+    pub(crate) fn matrix_counter_bytes(self) -> Option<usize> {
+        self.matrix.counter_bytes()
     }
 
     pub(crate) const fn calibration_counter_count(self) -> usize {
@@ -154,7 +155,7 @@ mod tests {
     fn fixed_layout_segments_are_contiguous() {
         let layout = FixedStorageLayout::new(6).unwrap();
 
-        assert_eq!(layout.matrix_counter_count(), 45_824);
+        assert_eq!(layout.matrix_counter_bytes(), Some(366_592));
         assert_eq!(layout.calibration_counter_count(), 6 * 3 * 250);
         assert_eq!(layout.online_counter_count(), 6 * 12);
         assert_eq!(layout.completion_start, layout.online_start + 6 * 12);
@@ -167,7 +168,7 @@ mod tests {
     fn checked_fixed_layout_covers_the_maximum_stage_count() {
         let layout = FixedStorageLayout::new(64).unwrap();
 
-        assert_eq!(layout.matrix_counter_count(), 528_384);
+        assert_eq!(layout.matrix_counter_bytes(), Some(4_227_072));
         assert_eq!(layout.calibration_counter_count(), 48_000);
         assert_eq!(layout.online_counter_count(), 768);
         assert_eq!(layout.completion_counter_count(), 128);
