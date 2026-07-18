@@ -447,12 +447,10 @@ impl FrozenStageCalibration {
         self.report
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn local_threshold(self) -> u64 {
         self.report.local.estimate.unwrap().value.unwrap()
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn cumulative_after_threshold(self) -> u64 {
         self.report
             .cumulative_after
@@ -462,7 +460,6 @@ impl FrozenStageCalibration {
             .unwrap()
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn previous_cumulative_threshold(self) -> Option<u64> {
         match self.report.previous_cumulative.estimate {
             Some(estimate) => estimate.value,

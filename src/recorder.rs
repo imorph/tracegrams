@@ -18,7 +18,25 @@ pub(crate) const CALIBRATION_COLLECTING: u8 = 0;
 pub(crate) const CALIBRATION_FREEZING: u8 = 1;
 pub(crate) const CALIBRATION_FROZEN: u8 = 2;
 // F×(Tl,Ta) = 4 + P×(Tp,Tl,Ta) = 8 disjoint truth-table cells (§5).
+pub(crate) const ONLINE_FIRST_COUNTERS: usize = 4;
 pub(crate) const ONLINE_COUNTERS_PER_STAGE: usize = 12;
+
+#[inline]
+pub(crate) fn first_online_counter(local_tail: bool, cumulative_after_tail: bool) -> usize {
+    usize::from(local_tail) * 2 + usize::from(cumulative_after_tail)
+}
+
+#[inline]
+pub(crate) fn predecessor_online_counter(
+    previous_tail: bool,
+    local_tail: bool,
+    cumulative_after_tail: bool,
+) -> usize {
+    ONLINE_FIRST_COUNTERS
+        + usize::from(previous_tail) * 4
+        + usize::from(local_tail) * 2
+        + usize::from(cumulative_after_tail)
+}
 const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
 const DIAGNOSTIC_COUNTERS: usize = 10;
 
@@ -356,5 +374,29 @@ mod tests {
         increment_counter(&counter, &overflows);
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
         assert_eq!(overflows.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn online_truth_table_cells_are_disjoint_and_complete() {
+        let mut cells = Vec::new();
+        for local_tail in [false, true] {
+            for cumulative_after_tail in [false, true] {
+                cells.push(first_online_counter(local_tail, cumulative_after_tail));
+            }
+        }
+        for previous_tail in [false, true] {
+            for local_tail in [false, true] {
+                for cumulative_after_tail in [false, true] {
+                    cells.push(predecessor_online_counter(
+                        previous_tail,
+                        local_tail,
+                        cumulative_after_tail,
+                    ));
+                }
+            }
+        }
+        cells.sort_unstable();
+
+        assert_eq!(cells, (0..ONLINE_COUNTERS_PER_STAGE).collect::<Vec<_>>());
     }
 }

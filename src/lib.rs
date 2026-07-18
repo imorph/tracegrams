@@ -19,8 +19,9 @@ pub use calibration::{
 };
 pub use context::{Ctx, ManualCtx, Outcome};
 pub use diagnose::{
-    BucketThreshold, MatrixScore, MatrixScores, MatrixThresholds, ScorePath, ScorePopulation,
-    ScoreStatus,
+    BucketThreshold, CalibratedOnlineScore, CalibratedOnlineScores, CalibratedThresholds,
+    Classification, DiagnoseConfig, DiagnoseError, DiagnosisReport, MatrixScore, MatrixScores,
+    MatrixThresholds, ScorePath, ScorePopulation, ScoreStatus,
 };
 pub use init::{InitError, MemoryEstimate, StageId, Tracegrams, TracegramsBuilder};
 pub use snapshot::{

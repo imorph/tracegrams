@@ -8,7 +8,7 @@ use crate::bucket::bucketize;
 use crate::init::{RegistryCookie, StageId, Tracegrams};
 use crate::recorder::{
     CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationDistribution,
-    DiagnosticCounter,
+    DiagnosticCounter, first_online_counter, predecessor_online_counter,
 };
 
 /// The terminal outcome of a recorded request.
@@ -279,6 +279,7 @@ impl Tracegrams {
         let advance = self.record_valid_mark(
             context.cumulative_ns,
             previous,
+            context.calibration_epoch(),
             stage,
             local_ns,
             latency_overflowed,
@@ -308,6 +309,7 @@ impl Tracegrams {
         let advance = self.record_valid_mark(
             context.cumulative_ns,
             context.previous,
+            context.calibration_epoch,
             stage,
             local_ns,
             latency_overflowed,
@@ -345,11 +347,12 @@ impl Tracegrams {
 
     // Keep the ordered atomic update sequence together: context advancement
     // must remain visibly outside and last in each caller.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn record_valid_mark(
         &self,
         previous_cumulative_ns: u64,
         previous: Option<PreviousMark>,
+        context_calibration_epoch: u16,
         stage: StageId,
         local_ns: u64,
         latency_overflowed: bool,
@@ -431,7 +434,14 @@ impl Tracegrams {
             CALIBRATION_FREEZING => self
                 .inner
                 .increment_diagnostic(DiagnosticCounter::CalibrationSamplesSkippedWhileFreezing),
-            CALIBRATION_FROZEN => {}
+            CALIBRATION_FROZEN => self.record_frozen_online(
+                context_calibration_epoch,
+                previous_cumulative_ns,
+                previous,
+                stage,
+                local_ns,
+                cumulative_ns,
+            ),
             _ => unreachable!("calibration state has a fixed internal representation"),
         }
 
@@ -455,6 +465,47 @@ impl Tracegrams {
                 cumulative_bucket: cumulative_bucket as u8,
             },
         }
+    }
+
+    fn record_frozen_online(
+        &self,
+        context_calibration_epoch: u16,
+        previous_cumulative_ns: u64,
+        previous: Option<PreviousMark>,
+        stage: StageId,
+        local_ns: u64,
+        cumulative_after_ns: u64,
+    ) {
+        let frozen_epoch = self.inner.calibration_epoch.load(Ordering::Relaxed);
+        if context_calibration_epoch != frozen_epoch {
+            return;
+        }
+        let Some(calibration) = self.inner.frozen_calibration[stage.index()].get().copied() else {
+            return;
+        };
+        let local_tail = local_ns >= calibration.local_threshold();
+        let cumulative_after_tail = cumulative_after_ns >= calibration.cumulative_after_threshold();
+        let counter = if previous.is_some() {
+            let Some(previous_threshold) = calibration.previous_cumulative_threshold() else {
+                self.inner.increment_diagnostic(
+                    DiagnosticCounter::OnlineSamplesSkippedMissingPreviousThreshold,
+                );
+                return;
+            };
+            predecessor_online_counter(
+                previous_cumulative_ns >= previous_threshold,
+                local_tail,
+                cumulative_after_tail,
+            )
+        } else {
+            first_online_counter(local_tail, cumulative_after_tail)
+        };
+        let index = self
+            .inner
+            .layout
+            .online(stage.index(), counter)
+            .expect("registered stage and truth-table cell have fixed storage");
+        self.inner.increment(index);
     }
 }
 
@@ -667,6 +718,31 @@ mod tests {
 
         assert_eq!(raw_counters(&clocked), raw_counters(&manual));
         assert_test_clock_consumed(&clocked, 3);
+    }
+
+    #[test]
+    fn clocked_finish_updates_the_frozen_online_epoch() {
+        let mut builder = Tracegrams::builder();
+        let stage = builder.stage("stage").unwrap();
+        let tracegrams = builder.build().unwrap();
+        tracegrams.record_elapsed(
+            &mut tracegrams.start_manual(),
+            stage,
+            Duration::from_nanos(100),
+        );
+        tracegrams
+            .try_freeze_calibration(crate::FreezeCriteria::all_stages(1))
+            .unwrap();
+        install_test_clock(&tracegrams, &[(1_000, false), (2_000, false)]);
+
+        tracegrams.finish(tracegrams.start(), stage, Outcome::Success);
+
+        let snapshot = tracegrams.snapshot_relaxed();
+        assert_eq!(snapshot.sample_counts(stage).unwrap().online(), 1);
+        let scores = snapshot.calibrated_online_scores(stage).unwrap();
+        assert_eq!(scores.tail_onset().numerator(), 1);
+        assert_eq!(scores.tail_onset().denominator(), 1);
+        assert_test_clock_consumed(&tracegrams, 2);
     }
 
     #[test]

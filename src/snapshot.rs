@@ -434,9 +434,15 @@ impl Snapshot {
             .get(start..start + self.calibration_bucket_bounds.len() + 1)
     }
 
+    pub(crate) fn online_counts(&self, stage: StageId) -> Option<&[u64]> {
+        let stage = self.stage_index(stage)?;
+        let start = self.layout.online(stage, 0)?;
+        self.counters.get(start..start + ONLINE_COUNTERS_PER_STAGE)
+    }
+
     /// Returns totals for every stored sample population at `stage`.
     pub fn sample_counts(&self, stage: StageId) -> Option<SampleCounts> {
-        let stage_index = self.stage_index(stage)?;
+        self.stage_index(stage)?;
         let local = sum(self.local_counts(stage)?);
         let cumulative_after = sum(self.cumulative_counts(stage)?);
         let cause = sum(self.cause_counts(stage)?);
@@ -446,10 +452,7 @@ impl Snapshot {
             sum(self.calibration_counts(stage, CalibrationPopulation::CumulativeAfter)?);
         let calibration_previous_cumulative =
             sum(self.calibration_counts(stage, CalibrationPopulation::PreviousCumulative)?);
-        let online_start = self.layout.online(stage_index, 0)?;
-        let online = sum(self
-            .counters
-            .get(online_start..online_start + ONLINE_COUNTERS_PER_STAGE)?);
+        let online = sum(self.online_counts(stage)?);
 
         Some(SampleCounts {
             local,
@@ -677,6 +680,10 @@ impl DeltaSnapshot {
         population: CalibrationPopulation,
     ) -> Option<&[u64]> {
         self.snapshot.calibration_counts(stage, population)
+    }
+
+    pub(crate) fn online_counts(&self, stage: StageId) -> Option<&[u64]> {
+        self.snapshot.online_counts(stage)
     }
 
     /// Returns totals for every stored sample population in this window.
