@@ -12,6 +12,10 @@ mod recorder;
 mod snapshot;
 
 pub use context::{Ctx, ManualCtx, Outcome};
+pub use diagnose::{
+    BucketThreshold, MatrixScore, MatrixScores, MatrixThresholds, ScorePath, ScorePopulation,
+    ScoreStatus,
+};
 pub use init::{InitError, MemoryEstimate, StageId, Tracegrams, TracegramsBuilder};
 pub use snapshot::{
     CalibrationPopulation, CalibrationState, CompletionCounts, Consistency, DeltaError,
