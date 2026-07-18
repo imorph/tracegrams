@@ -15,13 +15,15 @@
 //! - relaxed snapshots and pure delta: `snapshot_delta`;
 //! - matrix-derived and calibrated-online score paths: `diagnosis`;
 //! - pure diagnosis and stable display report: `diagnosis`;
-//! - performance screening: `benches/checkpoint.rs` (Stage 9);
-//! - manual axum integration and service A/B: private experiment repo (Stage 10).
+//! - performance screening: `benches/checkpoint.rs` plus retained private
+//!   Stage 9 artifacts (ARM64 passed; `x86_64` remains pending);
+//! - manual axum integration and service A/B: retained private Stage 10 code
+//!   and artifacts.
 //!
 //! Numeric contracts shared by those areas are unit-tested beside `bucket`,
-//! `matrix`, and `recorder`. Context layout/trait assertions remain explicit
-//! placeholders until `Ctx` exists in Stage 4, so they cannot pass for the
-//! wrong type.
+//! `matrix`, and `recorder`. Context layout/trait assertions are active in
+//! `clocked_recording`; non-`Clone`/non-`Copy` constraints are compile-fail
+//! examples on `Ctx`.
 
 mod calibration;
 mod clocked_recording;
