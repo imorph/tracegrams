@@ -581,6 +581,59 @@ mod tests {
     }
 
     #[test]
+    fn invalid_quantiles_are_rejected() {
+        for quantile in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.5,
+            0.0,
+            1.000_000_1,
+        ] {
+            assert_eq!(
+                nearest_rank(&[1], quantile),
+                Err(QuantileError::InvalidQuantile)
+            );
+            assert_eq!(
+                estimate_quantile(&[1, 0], &[100], quantile),
+                Err(QuantileError::InvalidQuantile)
+            );
+        }
+    }
+
+    #[test]
+    fn counter_total_overflow_is_reported() {
+        assert_eq!(
+            nearest_rank(&[u64::MAX, 1], 0.99),
+            Err(QuantileError::CounterTotalOverflow)
+        );
+        assert_eq!(
+            estimate_quantile(&[u64::MAX, u64::MAX], &[100], 0.99),
+            Err(QuantileError::CounterTotalOverflow)
+        );
+    }
+
+    #[test]
+    fn estimate_rejects_mismatched_shapes() {
+        assert_eq!(
+            estimate_quantile(&[], &[], 0.99),
+            Err(QuantileError::ShapeMismatch)
+        );
+        assert_eq!(
+            estimate_quantile(&[1], &[], 0.99),
+            Err(QuantileError::ShapeMismatch)
+        );
+        assert_eq!(
+            estimate_quantile(&[1], &[100], 0.99),
+            Err(QuantileError::ShapeMismatch)
+        );
+        assert_eq!(
+            estimate_quantile(&[1, 2, 3], &[100], 0.99),
+            Err(QuantileError::ShapeMismatch)
+        );
+    }
+
+    #[test]
     fn selected_terminal_bucket_has_no_finite_estimate() {
         let bounds = calibration_bounds();
         let mut counts = [0; CALIBRATION_BUCKETS];

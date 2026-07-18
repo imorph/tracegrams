@@ -2,7 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) fn increment_counter(counter: &AtomicU64, overflows: &AtomicU64) {
+/// Increments `counter`, diverting the increment into `overflows` once the
+/// counter saturates so no total is silently lost.
+pub fn increment_counter(counter: &AtomicU64, overflows: &AtomicU64) {
     if !increment_saturating(counter) {
         increment_saturating(overflows);
     }
