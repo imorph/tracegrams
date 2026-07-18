@@ -5,9 +5,12 @@
 mod bucket;
 mod context;
 mod diagnose;
+mod init;
 #[allow(dead_code)]
 mod matrix;
 mod recorder;
+
+pub use init::{InitError, MemoryEstimate, StageId, Tracegrams, TracegramsBuilder};
 
 #[doc(hidden)]
 pub mod internal {
