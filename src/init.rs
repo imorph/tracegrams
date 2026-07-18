@@ -3,10 +3,11 @@
 use std::error::Error;
 use std::fmt;
 use std::mem::size_of;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::bucket::{CALIBRATION_BUCKETS, calibration_bounds, default_bounds};
+use crate::calibration::FrozenStageCalibration;
 use crate::recorder::{FixedStorageLayout, Inner};
 
 const DEFAULT_TAIL_QUANTILE: f64 = 0.99;
@@ -61,6 +62,7 @@ impl fmt::Debug for StageId {
 pub struct MemoryEstimate {
     matrix: usize,
     calibration: usize,
+    calibration_thresholds: usize,
     online: usize,
     bounds: usize,
     stage_metadata: usize,
@@ -79,6 +81,11 @@ impl MemoryEstimate {
     /// Bytes used by calibration distributions.
     pub const fn calibration_bytes(self) -> usize {
         self.calibration
+    }
+
+    /// Bytes used by fixed calibration-threshold publication cells.
+    pub const fn calibration_threshold_bytes(self) -> usize {
+        self.calibration_thresholds
     }
 
     /// Bytes used by calibrated-online truth-table counters.
@@ -350,6 +357,10 @@ fn estimate_memory(
         .matrix_counter_bytes()
         .ok_or(InitError::SizeOverflow)?;
     let calibration_bytes = checked_bytes(layout.calibration_counter_count(), counter_bytes)?;
+    let calibration_threshold_bytes = checked_bytes(
+        layout.stage_count(),
+        size_of::<OnceLock<FrozenStageCalibration>>(),
+    )?;
     let online_bytes = checked_bytes(layout.online_counter_count(), counter_bytes)?;
     let completion_bytes = checked_bytes(layout.completion_counter_count(), counter_bytes)?;
     let diagnostics_bytes = checked_bytes(
@@ -380,6 +391,7 @@ fn estimate_memory(
     let total_bytes = [
         matrix_bytes,
         calibration_bytes,
+        calibration_threshold_bytes,
         online_bytes,
         bounds_bytes,
         stage_metadata_bytes,
@@ -395,6 +407,7 @@ fn estimate_memory(
     Ok(MemoryEstimate {
         matrix: matrix_bytes,
         calibration: calibration_bytes,
+        calibration_thresholds: calibration_threshold_bytes,
         online: online_bytes,
         bounds: bounds_bytes,
         stage_metadata: stage_metadata_bytes,
@@ -492,6 +505,10 @@ mod tests {
         assert_eq!(
             tracegrams.inner.counters.len(),
             tracegrams.inner.layout.counter_count()
+        );
+        assert_eq!(
+            tracegrams.inner.frozen_calibration.len(),
+            tracegrams.inner.layout.stage_count()
         );
     }
 }

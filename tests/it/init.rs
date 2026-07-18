@@ -99,6 +99,7 @@ fn memory_estimate_is_itemized_and_pins_the_matrix_formula() {
     let estimate = builder.estimated_memory().unwrap();
     assert_eq!(estimate.matrix_bytes(), 366_592);
     assert_eq!(estimate.calibration_bytes(), 6 * 6_000);
+    assert!(estimate.calibration_threshold_bytes() > 0);
     assert!(estimate.online_bytes() > 0);
     assert!(estimate.bounds_bytes() > 0);
     assert!(estimate.stage_metadata_bytes() > 0);
@@ -109,6 +110,7 @@ fn memory_estimate_is_itemized_and_pins_the_matrix_formula() {
         estimate.total_bytes(),
         estimate.matrix_bytes()
             + estimate.calibration_bytes()
+            + estimate.calibration_threshold_bytes()
             + estimate.online_bytes()
             + estimate.bounds_bytes()
             + estimate.stage_metadata_bytes()

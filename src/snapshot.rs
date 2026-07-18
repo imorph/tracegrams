@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::atomic::Ordering;
 
 use crate::bucket::BUCKETS;
+use crate::calibration::FreezeReport;
 use crate::init::{MemoryEstimate, RegistryCookie, StageId, Tracegrams};
 use crate::recorder::{
     CalibrationDistribution, DiagnosticCounter, FixedStorageLayout, ONLINE_COUNTERS_PER_STAGE,
@@ -331,6 +332,7 @@ pub struct Snapshot {
     tail_quantile: f64,
     calibration_state: CalibrationState,
     calibration_epoch: u16,
+    calibration_report: Option<FreezeReport>,
     memory_budget_bytes: usize,
     memory_estimate: MemoryEstimate,
     consistency: Consistency,
@@ -376,6 +378,11 @@ impl Snapshot {
     /// Returns the observed calibration epoch.
     pub const fn calibration_epoch(&self) -> u16 {
         self.calibration_epoch
+    }
+
+    /// Returns the immutable successful freeze report after publication.
+    pub const fn calibration_report(&self) -> Option<&FreezeReport> {
+        self.calibration_report.as_ref()
     }
 
     /// Returns the recorder's configured memory budget.
@@ -628,6 +635,11 @@ impl DeltaSnapshot {
         self.snapshot.calibration_epoch()
     }
 
+    /// Returns the successful freeze report observed at the later endpoint.
+    pub const fn calibration_report(&self) -> Option<&FreezeReport> {
+        self.snapshot.calibration_report()
+    }
+
     /// Returns the recorder's configured memory budget.
     pub const fn memory_budget_bytes(&self) -> usize {
         self.snapshot.memory_budget_bytes()
@@ -726,6 +738,12 @@ impl Tracegrams {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        let calibration_state =
+            CalibrationState::from_raw(self.inner.calibration_state.load(Ordering::Acquire));
+        let calibration_report = (calibration_state == CalibrationState::Frozen)
+            .then(|| self.frozen_calibration_report())
+            .flatten();
+
         Snapshot {
             cookie: self.inner.cookie,
             stages,
@@ -734,10 +752,13 @@ impl Tracegrams {
             bucket_bounds: self.inner.default_bounds.clone(),
             calibration_bucket_bounds: self.inner.calibration_bounds.clone(),
             tail_quantile: self.inner.tail_quantile,
-            calibration_state: CalibrationState::from_raw(
-                self.inner.calibration_state.load(Ordering::Acquire),
-            ),
-            calibration_epoch: self.inner.calibration_epoch.load(Ordering::Acquire),
+            calibration_state,
+            calibration_epoch: if calibration_state == CalibrationState::Frozen {
+                self.inner.calibration_epoch.load(Ordering::Relaxed)
+            } else {
+                0
+            },
+            calibration_report,
             memory_budget_bytes: self.inner.memory_budget_bytes,
             memory_estimate: self.inner.memory_estimate,
             consistency: Consistency::Relaxed,
@@ -770,7 +791,11 @@ mod tests {
         tracegrams
             .inner
             .calibration_epoch
-            .store(1, Ordering::Release);
+            .store(1, Ordering::Relaxed);
+        tracegrams
+            .inner
+            .calibration_state
+            .store(crate::recorder::CALIBRATION_FROZEN, Ordering::Release);
         let mut context = tracegrams.start_manual();
         tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(50));
         tracegrams.finish_manual(context, second, Duration::from_nanos(75), Outcome::Success);

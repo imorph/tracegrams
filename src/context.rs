@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 
 use crate::bucket::bucketize;
 use crate::init::{RegistryCookie, StageId, Tracegrams};
-use crate::recorder::{CalibrationDistribution, DiagnosticCounter};
+use crate::recorder::{
+    CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationDistribution,
+    DiagnosticCounter,
+};
 
 /// The terminal outcome of a recorded request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,7 +188,7 @@ impl Tracegrams {
         Ctx::new(
             reading.timestamp_ns,
             self.inner.cookie,
-            self.inner.calibration_epoch.load(Ordering::Acquire),
+            self.current_calibration_epoch(),
         )
     }
 
@@ -206,7 +209,7 @@ impl Tracegrams {
         ManualCtx {
             cumulative_ns: 0,
             cookie: self.inner.cookie,
-            calibration_epoch: self.inner.calibration_epoch.load(Ordering::Acquire),
+            calibration_epoch: self.current_calibration_epoch(),
             previous: None,
         }
     }
@@ -395,32 +398,41 @@ impl Tracegrams {
             }
         }
 
-        let calibration_local = bucketize(local_ns, &self.inner.calibration_bounds);
-        let calibration_after = bucketize(cumulative_ns, &self.inner.calibration_bounds);
-        if let Some(index) = self.inner.layout.calibration(
-            stage.index(),
-            CalibrationDistribution::Local,
-            calibration_local,
-        ) {
-            self.inner.increment(index);
-        }
-        if let Some(index) = self.inner.layout.calibration(
-            stage.index(),
-            CalibrationDistribution::CumulativeAfter,
-            calibration_after,
-        ) {
-            self.inner.increment(index);
-        }
-        if previous.is_some() {
-            let calibration_previous =
-                bucketize(previous_cumulative_ns, &self.inner.calibration_bounds);
-            if let Some(index) = self.inner.layout.calibration(
-                stage.index(),
-                CalibrationDistribution::PreviousCumulative,
-                calibration_previous,
-            ) {
-                self.inner.increment(index);
+        match self.inner.calibration_state.load(Ordering::Acquire) {
+            CALIBRATION_COLLECTING => {
+                let calibration_local = bucketize(local_ns, &self.inner.calibration_bounds);
+                let calibration_after = bucketize(cumulative_ns, &self.inner.calibration_bounds);
+                if let Some(index) = self.inner.layout.calibration(
+                    stage.index(),
+                    CalibrationDistribution::Local,
+                    calibration_local,
+                ) {
+                    self.inner.increment(index);
+                }
+                if let Some(index) = self.inner.layout.calibration(
+                    stage.index(),
+                    CalibrationDistribution::CumulativeAfter,
+                    calibration_after,
+                ) {
+                    self.inner.increment(index);
+                }
+                if previous.is_some() {
+                    let calibration_previous =
+                        bucketize(previous_cumulative_ns, &self.inner.calibration_bounds);
+                    if let Some(index) = self.inner.layout.calibration(
+                        stage.index(),
+                        CalibrationDistribution::PreviousCumulative,
+                        calibration_previous,
+                    ) {
+                        self.inner.increment(index);
+                    }
+                }
             }
+            CALIBRATION_FREEZING => self
+                .inner
+                .increment_diagnostic(DiagnosticCounter::CalibrationSamplesSkippedWhileFreezing),
+            CALIBRATION_FROZEN => {}
+            _ => unreachable!("calibration state has a fixed internal representation"),
         }
 
         if let Some(outcome) = outcome {
@@ -598,7 +610,11 @@ mod tests {
         tracegrams
             .inner
             .calibration_epoch
-            .store(u16::MAX, Ordering::Release);
+            .store(u16::MAX, Ordering::Relaxed);
+        tracegrams
+            .inner
+            .calibration_state
+            .store(CALIBRATION_FROZEN, Ordering::Release);
         install_test_clock(&tracegrams, &[(u64::MAX, false)]);
         let mut context = tracegrams.start();
 
@@ -1250,6 +1266,63 @@ mod tests {
                 .map(|counter| counter.load(Ordering::Relaxed))
                 .sum::<u64>(),
             12
+        );
+    }
+
+    #[test]
+    fn freezing_mark_skips_the_entire_calibration_sample() {
+        let (tracegrams, first, _) = two_stage_recorder();
+        tracegrams
+            .inner
+            .calibration_state
+            .store(CALIBRATION_FREEZING, Ordering::Release);
+
+        tracegrams.record_elapsed(
+            &mut tracegrams.start_manual(),
+            first,
+            Duration::from_nanos(1_000),
+        );
+
+        let ordinary_bucket = bucketize(1_000, &tracegrams.inner.default_bounds);
+        assert_eq!(
+            count(
+                &tracegrams,
+                tracegrams
+                    .inner
+                    .layout
+                    .local(first.index(), ordinary_bucket)
+                    .unwrap(),
+            ),
+            1
+        );
+        for distribution in [
+            CalibrationDistribution::Local,
+            CalibrationDistribution::CumulativeAfter,
+            CalibrationDistribution::PreviousCumulative,
+        ] {
+            assert_eq!(
+                total(
+                    &tracegrams,
+                    (0..CALIBRATION_BUCKETS).map(|bucket| {
+                        tracegrams
+                            .inner
+                            .layout
+                            .calibration(first.index(), distribution, bucket)
+                            .unwrap()
+                    }),
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            count(
+                &tracegrams,
+                tracegrams
+                    .inner
+                    .layout
+                    .diagnostic(DiagnosticCounter::CalibrationSamplesSkippedWhileFreezing,),
+            ),
+            1
         );
     }
 

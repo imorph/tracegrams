@@ -3,6 +3,7 @@
 // These foundations are wired into the runtime in Stages 2 and 3.
 #[allow(dead_code)]
 mod bucket;
+mod calibration;
 mod context;
 mod diagnose;
 mod init;
@@ -11,6 +12,11 @@ mod matrix;
 mod recorder;
 mod snapshot;
 
+pub use calibration::{
+    CalibrationConsistency, CalibrationEstimate, CalibrationPopulationReport, CalibrationReadiness,
+    CalibrationTerminal, CalibrationThresholdAvailability, FreezeCriteria, FreezeError,
+    FreezeReport, PopulationReadiness, StageCalibrationReadiness, StageCalibrationReport,
+};
 pub use context::{Ctx, ManualCtx, Outcome};
 pub use diagnose::{
     BucketThreshold, MatrixScore, MatrixScores, MatrixThresholds, ScorePath, ScorePopulation,
