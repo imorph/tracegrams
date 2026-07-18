@@ -30,6 +30,16 @@ pub struct StageId {
     index: u8,
 }
 
+impl StageId {
+    pub(crate) const fn cookie(self) -> RegistryCookie {
+        self.cookie
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.index as usize
+    }
+}
+
 impl fmt::Debug for StageId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("StageId").field(&self.index).finish()

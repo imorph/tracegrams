@@ -13,6 +13,56 @@ const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
 const DIAGNOSTIC_COUNTERS: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CalibrationDistribution {
+    Local,
+    CumulativeAfter,
+    PreviousCumulative,
+}
+
+impl CalibrationDistribution {
+    const fn offset(self) -> usize {
+        match self {
+            Self::Local => 0,
+            Self::CumulativeAfter => 1,
+            Self::PreviousCumulative => 2,
+        }
+    }
+}
+
+// Some fixed snapshot-visible slots are connected by later hot-path stages.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiagnosticCounter {
+    InvalidStageMarks,
+    InvalidContextMarks,
+    NonMonotonicMarks,
+    MarksAfterFinish,
+    ClockRegressions,
+    LatencyOverflows,
+    CumulativeOverflows,
+    CounterOverflows,
+    CalibrationSamplesSkippedWhileFreezing,
+    OnlineSamplesSkippedMissingPreviousThreshold,
+}
+
+impl DiagnosticCounter {
+    const fn offset(self) -> usize {
+        match self {
+            Self::InvalidStageMarks => 0,
+            Self::InvalidContextMarks => 1,
+            Self::NonMonotonicMarks => 2,
+            Self::MarksAfterFinish => 3,
+            Self::ClockRegressions => 4,
+            Self::LatencyOverflows => 5,
+            Self::CumulativeOverflows => 6,
+            Self::CounterOverflows => 7,
+            Self::CalibrationSamplesSkippedWhileFreezing => 8,
+            Self::OnlineSamplesSkippedMissingPreviousThreshold => 9,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FixedStorageLayout {
     stage_count: usize,
     matrix: StorageLayout,
@@ -81,6 +131,65 @@ impl FixedStorageLayout {
     pub(crate) const fn counter_count(self) -> usize {
         self.counter_count
     }
+
+    pub(crate) fn local(self, stage: usize, bucket: usize) -> Option<usize> {
+        self.matrix.local(stage, bucket)
+    }
+
+    pub(crate) fn cumulative(self, stage: usize, bucket: usize) -> Option<usize> {
+        self.matrix.cumulative(stage, bucket)
+    }
+
+    pub(crate) fn cause(
+        self,
+        destination: usize,
+        previous_cumulative: usize,
+        local: usize,
+    ) -> Option<usize> {
+        self.matrix.cause(destination, previous_cumulative, local)
+    }
+
+    pub(crate) fn incoming(
+        self,
+        destination: usize,
+        previous_cumulative: usize,
+        cumulative_after: usize,
+    ) -> Option<usize> {
+        self.matrix
+            .incoming(destination, previous_cumulative, cumulative_after)
+    }
+
+    pub(crate) fn calibration(
+        self,
+        stage: usize,
+        distribution: CalibrationDistribution,
+        bucket: usize,
+    ) -> Option<usize> {
+        if stage >= self.stage_count || bucket >= CALIBRATION_BUCKETS {
+            return None;
+        }
+        self.calibration_start
+            .checked_add(
+                stage
+                    .checked_mul(CALIBRATION_DISTRIBUTIONS_PER_STAGE)?
+                    .checked_add(distribution.offset())?
+                    .checked_mul(CALIBRATION_BUCKETS)?,
+            )?
+            .checked_add(bucket)
+    }
+
+    pub(crate) fn completion(self, stage: usize, error: bool) -> Option<usize> {
+        if stage >= self.stage_count {
+            return None;
+        }
+        self.completion_start
+            .checked_add(stage.checked_mul(COMPLETION_COUNTERS_PER_STAGE)?)?
+            .checked_add(usize::from(error))
+    }
+
+    pub(crate) fn diagnostic(self, diagnostic: DiagnosticCounter) -> usize {
+        self.diagnostic_start + diagnostic.offset()
+    }
 }
 
 #[allow(dead_code)] // Storage fields are connected to checkpoints in Stage 3.
@@ -123,6 +232,15 @@ impl Inner {
             calibration_state: AtomicU8::new(0),
             calibration_epoch: AtomicU16::new(0),
         }
+    }
+
+    pub(crate) fn increment(&self, index: usize) {
+        let overflow = self.layout.diagnostic(DiagnosticCounter::CounterOverflows);
+        increment_counter(&self.counters[index], &self.counters[overflow]);
+    }
+
+    pub(crate) fn increment_diagnostic(&self, diagnostic: DiagnosticCounter) {
+        self.increment(self.layout.diagnostic(diagnostic));
     }
 }
 
