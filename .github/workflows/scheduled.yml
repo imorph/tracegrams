@@ -24,7 +24,7 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
         with: { toolchain: nightly }
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # tag=v2.83.3
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # tag=v2.85.4
         with: { tool: just }
       - run: just test
 
@@ -35,7 +35,7 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
         with: { toolchain: stable }
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # tag=v2.83.3
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # tag=v2.85.4
         with: { tool: just }
       - run: just test-latest-deps
 
@@ -46,6 +46,6 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
         with: { toolchain: stable }
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # tag=v2.83.3
+      - uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # tag=v2.85.4
         with: { tool: "just,cargo-deny" }
       - run: just deny-advisories
