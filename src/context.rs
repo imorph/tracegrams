@@ -370,7 +370,11 @@ impl Tracegrams {
             u64::MAX
         };
         let local_bucket = bucketize(local_ns, &self.inner.default_bounds);
-        let cumulative_bucket = bucketize(cumulative_ns, &self.inner.default_bounds);
+        let cumulative_bucket = if previous.is_none() {
+            local_bucket
+        } else {
+            bucketize(cumulative_ns, &self.inner.default_bounds)
+        };
 
         if let Some(index) = self.inner.layout.local(stage.index(), local_bucket) {
             self.inner.increment(index);
@@ -404,7 +408,11 @@ impl Tracegrams {
         match self.inner.calibration_state.load(Ordering::Acquire) {
             CALIBRATION_COLLECTING => {
                 let calibration_local = bucketize(local_ns, &self.inner.calibration_bounds);
-                let calibration_after = bucketize(cumulative_ns, &self.inner.calibration_bounds);
+                let calibration_after = if previous.is_none() {
+                    calibration_local
+                } else {
+                    bucketize(cumulative_ns, &self.inner.calibration_bounds)
+                };
                 if let Some(index) = self.inner.layout.calibration(
                     stage.index(),
                     CalibrationDistribution::Local,
