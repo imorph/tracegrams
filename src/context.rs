@@ -1356,7 +1356,7 @@ mod tests {
         tracegrams.record_elapsed(
             &mut tracegrams.start_manual(),
             first,
-            Duration::from_nanos(1_000),
+            Duration::from_micros(1),
         );
 
         let ordinary_bucket = bucketize(1_000, &tracegrams.inner.default_bounds);
@@ -1406,7 +1406,7 @@ mod tests {
     fn first_mark_uses_a_clean_sentinel() {
         let (tracegrams, first, _) = two_stage_recorder();
         let mut context = tracegrams.start_manual();
-        tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(1_000));
+        tracegrams.record_elapsed(&mut context, first, Duration::from_micros(1));
 
         let ordinary_bucket = bucketize(1_000, &tracegrams.inner.default_bounds);
         let calibration_bucket = bucketize(1_000, &tracegrams.inner.calibration_bounds);

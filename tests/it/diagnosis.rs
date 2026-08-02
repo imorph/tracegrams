@@ -90,7 +90,7 @@ fn first_only_stage_has_no_invented_matrix_scores() {
     tracegrams.finish_manual(
         tracegrams.start_manual(),
         first,
-        Duration::from_nanos(1_000_000),
+        Duration::from_millis(1),
         Outcome::Success,
     );
 
@@ -128,7 +128,7 @@ fn mixed_stage_matrix_scores_stay_predecessor_only() {
     tracegrams.finish_manual(
         context,
         destination,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
         Outcome::Success,
     );
     let predecessor_only = tracegrams
@@ -170,7 +170,7 @@ fn skipped_paths_score_the_destination_stage() {
     tracegrams.finish_manual(
         context,
         destination,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
         Outcome::Success,
     );
 
@@ -236,7 +236,7 @@ fn snapshot_and_delta_matrix_scores_are_pure_and_deterministic() {
     tracegrams.finish_manual(
         context,
         destination,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
         Outcome::Success,
     );
     let after = tracegrams.snapshot_relaxed();
@@ -329,7 +329,7 @@ fn first_marks_affect_only_clean_origin_and_onset_populations() {
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         only,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
     );
 
     let snapshot = tracegrams.snapshot_relaxed();
@@ -368,7 +368,7 @@ fn pre_freeze_context_never_writes_the_published_online_epoch() {
         .try_freeze_calibration(FreezeCriteria::all_stages(1))
         .unwrap();
 
-    tracegrams.record_elapsed(&mut old_context, stage, Duration::from_nanos(1_000));
+    tracegrams.record_elapsed(&mut old_context, stage, Duration::from_micros(1));
     let after_old = tracegrams.snapshot_relaxed();
     assert_eq!(after_old.sample_counts(stage).unwrap().local(), 2);
     assert_eq!(after_old.sample_counts(stage).unwrap().online(), 0);
@@ -376,7 +376,7 @@ fn pre_freeze_context_never_writes_the_published_online_epoch() {
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         stage,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
     );
     assert_eq!(
         tracegrams
@@ -406,7 +406,7 @@ fn predecessor_after_first_only_freeze_skips_the_whole_online_sample() {
     let before = tracegrams.snapshot_relaxed();
     let mut context = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
-    tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(1_000));
+    tracegrams.record_elapsed(&mut context, destination, Duration::from_micros(1));
     let after = tracegrams.snapshot_relaxed();
 
     assert_eq!(after.sample_counts(destination).unwrap().online(), 0);
@@ -483,7 +483,7 @@ fn diagnosis_requires_calibration_and_classifies_from_numeric_scores() {
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         destination,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
     );
     for (previous_ns, local_ns) in [(100, 1_000), (1_000, 100), (1_000, 1_000)] {
         let mut context = tracegrams.start_manual();
@@ -559,7 +559,7 @@ fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         stage,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
     );
     let snapshot = tracegrams.snapshot_relaxed();
     let config = DiagnoseConfig::experimental_defaults();
@@ -626,7 +626,7 @@ fn cross_epoch_delta_keeps_matrix_scores_but_disables_online_diagnosis() {
         .unwrap();
     let mut context = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
-    tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(1_000));
+    tracegrams.record_elapsed(&mut context, destination, Duration::from_micros(1));
     let delta = tracegrams.snapshot_relaxed().delta(&earlier).unwrap();
 
     let matrix_scores = delta.matrix_scores(destination).unwrap();

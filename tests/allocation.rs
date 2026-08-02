@@ -67,7 +67,7 @@ fn frozen_recorder() -> (Tracegrams, StageId) {
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         stage,
-        Duration::from_nanos(1_000),
+        Duration::from_micros(1),
     );
     tracegrams
         .try_freeze_calibration(FreezeCriteria::all_stages(1))
@@ -80,13 +80,13 @@ fn assert_zero_allocations_for_hot_plane(tracegrams: &Tracegrams, stage: StageId
     assert_eq!(allocations, 0, "manual request start allocated");
 
     let ((), allocations) = allocations_during(|| {
-        tracegrams.record_elapsed(&mut manual, stage, Duration::from_nanos(1_000));
+        tracegrams.record_elapsed(&mut manual, stage, Duration::from_micros(1));
     });
     assert_eq!(allocations, 0, "manual checkpoint allocated");
 
     let manual = tracegrams.start_manual();
     let ((), allocations) = allocations_during(|| {
-        tracegrams.finish_manual(manual, stage, Duration::from_nanos(1_000), Outcome::Success);
+        tracegrams.finish_manual(manual, stage, Duration::from_micros(1), Outcome::Success);
     });
     assert_eq!(allocations, 0, "manual finish checkpoint allocated");
 
