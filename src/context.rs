@@ -183,7 +183,6 @@ impl fmt::Debug for ManualCtx {
 
 impl Tracegrams {
     /// Starts a wall-clock-timed request with one clock read.
-    #[inline]
     pub fn start(&self) -> Ctx {
         let reading = self.read_clock();
         Ctx::new(
@@ -194,21 +193,18 @@ impl Tracegrams {
     }
 
     /// Records one wall-clock interval ending at `stage`.
-    #[inline]
     pub fn mark(&self, context: &mut Ctx, stage: StageId) {
         let reading = self.read_clock();
         self.record_clocked_mark(context, stage, reading, None);
     }
 
     /// Records the final wall-clock interval and outcome, consuming the context.
-    #[inline]
     pub fn finish(&self, mut context: Ctx, stage: StageId, outcome: Outcome) {
         let reading = self.read_clock();
         self.record_clocked_mark(&mut context, stage, reading, Some(outcome));
     }
 
     /// Starts a caller-timed request without reading the clock.
-    #[inline]
     pub fn start_manual(&self) -> ManualCtx {
         ManualCtx {
             cumulative_ns: 0,
@@ -219,13 +215,11 @@ impl Tracegrams {
     }
 
     /// Records one caller-supplied elapsed interval at `stage`.
-    #[inline]
     pub fn record_elapsed(&self, context: &mut ManualCtx, stage: StageId, elapsed: Duration) {
         self.record_manual_mark(context, stage, elapsed, None);
     }
 
     /// Records the final interval and completion outcome, consuming the context.
-    #[inline]
     pub fn finish_manual(
         &self,
         mut context: ManualCtx,
@@ -368,10 +362,7 @@ impl Tracegrams {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::LatencyOverflows);
         }
-        let first_mark = previous.is_none();
-        let cumulative_ns = if first_mark {
-            local_ns
-        } else if let Some(value) = previous_cumulative_ns.checked_add(local_ns) {
+        let cumulative_ns = if let Some(value) = previous_cumulative_ns.checked_add(local_ns) {
             value
         } else {
             self.inner
@@ -379,7 +370,7 @@ impl Tracegrams {
             u64::MAX
         };
         let local_bucket = bucketize(local_ns, &self.inner.default_bounds);
-        let cumulative_bucket = if first_mark {
+        let cumulative_bucket = if previous.is_none() {
             local_bucket
         } else {
             bucketize(cumulative_ns, &self.inner.default_bounds)
@@ -417,7 +408,7 @@ impl Tracegrams {
         match self.inner.calibration_state.load(Ordering::Acquire) {
             CALIBRATION_COLLECTING => {
                 let calibration_local = bucketize(local_ns, &self.inner.calibration_bounds);
-                let calibration_after = if first_mark {
+                let calibration_after = if previous.is_none() {
                     calibration_local
                 } else {
                     bucketize(cumulative_ns, &self.inner.calibration_bounds)
