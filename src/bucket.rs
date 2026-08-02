@@ -330,6 +330,9 @@ pub(crate) const fn calibration_bounds() -> &'static [u64; CALIBRATION_BUCKETS -
 }
 
 pub(crate) fn bucketize(value: u64, bounds: &[u64]) -> usize {
+    if value < bounds[0] {
+        return 0;
+    }
     bounds.partition_point(|&bound| value >= bound)
 }
 

@@ -183,6 +183,7 @@ impl fmt::Debug for ManualCtx {
 
 impl Tracegrams {
     /// Starts a wall-clock-timed request with one clock read.
+    #[inline]
     pub fn start(&self) -> Ctx {
         let reading = self.read_clock();
         Ctx::new(
@@ -193,12 +194,14 @@ impl Tracegrams {
     }
 
     /// Records one wall-clock interval ending at `stage`.
+    #[inline]
     pub fn mark(&self, context: &mut Ctx, stage: StageId) {
         let reading = self.read_clock();
         self.record_clocked_mark(context, stage, reading, None);
     }
 
     /// Records the final wall-clock interval and outcome, consuming the context.
+    #[inline]
     pub fn finish(&self, mut context: Ctx, stage: StageId, outcome: Outcome) {
         let reading = self.read_clock();
         self.record_clocked_mark(&mut context, stage, reading, Some(outcome));
@@ -255,6 +258,7 @@ impl Tracegrams {
         ClockReading::from_elapsed(elapsed)
     }
 
+    #[inline]
     fn record_clocked_mark(
         &self,
         context: &mut Ctx,
