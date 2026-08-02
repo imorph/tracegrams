@@ -336,6 +336,23 @@ pub(crate) fn bucketize(value: u64, bounds: &[u64]) -> usize {
     bounds.partition_point(|&bound| value >= bound)
 }
 
+pub(crate) fn default_bucketize(value: u64) -> usize {
+    bucketize(value, &DEFAULT_BOUNDS)
+}
+
+#[inline]
+pub(crate) fn calibration_bucketize(value: u64, default_bucket: usize) -> usize {
+    if default_bucket == 0 {
+        return 0;
+    }
+    if default_bucket == BUCKETS - 1 {
+        return CALIBRATION_BUCKETS - 1;
+    }
+
+    let first = 1 + (default_bucket - 1) * 4;
+    first + CALIBRATION_BOUNDS[first..first + 3].partition_point(|&bound| value >= bound)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RankSelection {
     pub(crate) bucket: usize,
@@ -559,6 +576,22 @@ mod tests {
         );
         assert_eq!(bucketize(10_000_000_000, bounds), CALIBRATION_BUCKETS - 1);
         assert_eq!(bucketize(u64::MAX, bounds), CALIBRATION_BUCKETS - 1);
+    }
+
+    #[test]
+    fn calibration_bucketization_from_default_bucket_matches_the_pinned_grid() {
+        for value in calibration_bounds()
+            .iter()
+            .flat_map(|bound| [bound - 1, *bound, bound + 1])
+            .chain([0, u64::MAX])
+        {
+            let default_bucket = bucketize(value, default_bounds());
+            assert_eq!(
+                calibration_bucketize(value, default_bucket),
+                bucketize(value, calibration_bounds()),
+                "value={value}"
+            );
+        }
     }
 
     #[test]

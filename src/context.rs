@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::bucket::bucketize;
+use crate::bucket::{calibration_bucketize, default_bucketize};
 use crate::init::{RegistryCookie, StageId, Tracegrams};
 use crate::recorder::{
     CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationDistribution,
@@ -373,11 +373,11 @@ impl Tracegrams {
                 .increment_diagnostic(DiagnosticCounter::CumulativeOverflows);
             u64::MAX
         };
-        let local_bucket = bucketize(local_ns, &self.inner.default_bounds);
+        let local_bucket = default_bucketize(local_ns);
         let cumulative_bucket = if previous.is_none() {
             local_bucket
         } else {
-            bucketize(cumulative_ns, &self.inner.default_bounds)
+            default_bucketize(cumulative_ns)
         };
 
         if let Some(index) = self.inner.layout.local(stage.index(), local_bucket) {
@@ -411,11 +411,11 @@ impl Tracegrams {
 
         match self.inner.calibration_state.load(Ordering::Acquire) {
             CALIBRATION_COLLECTING => {
-                let calibration_local = bucketize(local_ns, &self.inner.calibration_bounds);
+                let calibration_local = calibration_bucketize(local_ns, local_bucket);
                 let calibration_after = if previous.is_none() {
                     calibration_local
                 } else {
-                    bucketize(cumulative_ns, &self.inner.calibration_bounds)
+                    calibration_bucketize(cumulative_ns, cumulative_bucket)
                 };
                 if let Some(index) = self.inner.layout.calibration(
                     stage.index(),
@@ -431,9 +431,11 @@ impl Tracegrams {
                 ) {
                     self.inner.increment(index);
                 }
-                if previous.is_some() {
-                    let calibration_previous =
-                        bucketize(previous_cumulative_ns, &self.inner.calibration_bounds);
+                if let Some(previous) = previous {
+                    let calibration_previous = calibration_bucketize(
+                        previous_cumulative_ns,
+                        usize::from(previous.cumulative_bucket),
+                    );
                     if let Some(index) = self.inner.layout.calibration(
                         stage.index(),
                         CalibrationDistribution::PreviousCumulative,
@@ -527,7 +529,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::bucket::{BUCKETS, CALIBRATION_BUCKETS};
+    use crate::bucket::{BUCKETS, CALIBRATION_BUCKETS, bucketize};
     use crate::recorder::FixedStorageLayout;
 
     fn two_stage_recorder() -> (Tracegrams, StageId, StageId) {
