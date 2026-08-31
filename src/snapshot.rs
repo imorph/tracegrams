@@ -546,9 +546,21 @@ impl Snapshot {
                 later: self.calibration_epoch,
             }
         };
-        let mut snapshot = self.clone();
-        snapshot.counters = counters;
-        snapshot.consistency = Consistency::Relaxed;
+        let snapshot = Snapshot {
+            cookie: self.cookie,
+            stages: self.stages.clone(),
+            layout: self.layout,
+            counters,
+            bucket_bounds: self.bucket_bounds.clone(),
+            calibration_bucket_bounds: self.calibration_bucket_bounds.clone(),
+            tail_quantile: self.tail_quantile,
+            calibration_state: self.calibration_state,
+            calibration_epoch: self.calibration_epoch,
+            calibration_report: self.calibration_report.clone(),
+            memory_budget_bytes: self.memory_budget_bytes,
+            memory_estimate: self.memory_estimate,
+            consistency: Consistency::Relaxed,
+        };
 
         Ok(DeltaSnapshot {
             snapshot,
