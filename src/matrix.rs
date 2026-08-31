@@ -106,8 +106,9 @@ impl StorageLayout {
         previous_cumulative: usize,
         cumulative_after: usize,
     ) -> usize {
-        debug_assert!(destination > 0);
-        debug_assert!(destination < self.stage_count);
+        // Hot-path callers uphold the layout invariants in release builds;
+        // debug builds assert them here before calculating the flat offset.
+        debug_assert!(destination > 0 && destination < self.stage_count);
         self.matrix_index_unchecked(
             self.incoming_start,
             destination - 1,
@@ -126,8 +127,9 @@ impl StorageLayout {
     }
 
     fn distribution_index_unchecked(self, start: usize, stage: usize, bucket: usize) -> usize {
-        debug_assert!(stage < self.stage_count);
-        debug_assert!(bucket < BUCKETS);
+        // Hot-path callers uphold the layout invariants in release builds;
+        // debug builds assert them here before calculating the flat offset.
+        debug_assert!(stage < self.stage_count && bucket < BUCKETS);
         start + stage * BUCKETS + bucket
     }
 
@@ -148,9 +150,9 @@ impl StorageLayout {
         row: usize,
         column: usize,
     ) -> usize {
-        debug_assert!(matrix < self.stage_count);
-        debug_assert!(row < BUCKETS);
-        debug_assert!(column < BUCKETS);
+        // Hot-path callers uphold the layout invariants in release builds;
+        // debug builds assert them here before calculating the flat offset.
+        debug_assert!(matrix < self.stage_count && row < BUCKETS && column < BUCKETS);
         start + matrix * MATRIX_CELLS + row * BUCKETS + column
     }
 }

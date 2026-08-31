@@ -239,8 +239,7 @@ impl FixedStorageLayout {
         distribution: CalibrationDistribution,
         bucket: usize,
     ) -> usize {
-        debug_assert!(stage < self.stage_count);
-        debug_assert!(bucket < CALIBRATION_BUCKETS);
+        assert!(stage < self.stage_count && bucket < CALIBRATION_BUCKETS);
         self.calibration_start
             + (stage * CALIBRATION_DISTRIBUTIONS_PER_STAGE + distribution.offset())
                 * CALIBRATION_BUCKETS
@@ -257,8 +256,9 @@ impl FixedStorageLayout {
     }
 
     pub(crate) fn online_index(self, stage: usize, counter: usize) -> usize {
-        debug_assert!(stage < self.stage_count);
-        debug_assert!(counter < ONLINE_COUNTERS_PER_STAGE);
+        // Hot-path callers uphold the layout invariants in release builds;
+        // debug builds assert them here before calculating the flat offset.
+        debug_assert!(stage < self.stage_count && counter < ONLINE_COUNTERS_PER_STAGE);
         self.online_start + stage * ONLINE_COUNTERS_PER_STAGE + counter
     }
 
@@ -272,7 +272,7 @@ impl FixedStorageLayout {
     }
 
     pub(crate) fn completion_index(self, stage: usize, error: bool) -> usize {
-        debug_assert!(stage < self.stage_count);
+        assert!(stage < self.stage_count);
         self.completion_start + stage * COMPLETION_COUNTERS_PER_STAGE + usize::from(error)
     }
 
