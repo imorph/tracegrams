@@ -254,8 +254,8 @@ struct Environment {
 
 #[derive(Serialize)]
 struct Protocol {
-    checkpoints_per_writer: u64,
-    warmup_checkpoints_per_writer: u64,
+    requests_per_writer: u64,
+    warmup_requests_per_writer: u64,
     repeats: usize,
     contended_writers: usize,
     release_equivalent: bool,
@@ -270,7 +270,8 @@ struct CellResult {
     operation: &'static str,
     pattern: &'static str,
     writers: usize,
-    checkpoints_per_writer: u64,
+    requests_per_writer: u64,
+    checkpoints_per_request: u64,
     raw_elapsed_ns: Vec<u128>,
     repeat_average_ns_per_checkpoint: Vec<f64>,
     repeat_aggregate_checkpoints_per_second: Vec<f64>,
@@ -410,11 +411,11 @@ fn run(options: &Options) -> Result<ScreeningReport, String> {
     let budgets = evaluate_budgets(&cells, &snapshots, &memory, options.contended_writers);
 
     Ok(ScreeningReport {
-        schema_version: 1,
+        schema_version: 2,
         environment: environment(),
         protocol: Protocol {
-            checkpoints_per_writer: options.checkpoints_per_writer,
-            warmup_checkpoints_per_writer: options.warmup_checkpoints_per_writer,
+            requests_per_writer: options.checkpoints_per_writer,
+            warmup_requests_per_writer: options.warmup_checkpoints_per_writer,
             repeats: options.repeats,
             contended_writers: options.contended_writers,
             release_equivalent,
@@ -543,7 +544,8 @@ fn measure_cell(
         operation: operation.name(),
         pattern: pattern.name(),
         writers,
-        checkpoints_per_writer: options.checkpoints_per_writer,
+        requests_per_writer: options.checkpoints_per_writer,
+        checkpoints_per_request: operation.checkpoints_per_request(),
         raw_elapsed_ns: elapsed_samples,
         repeat_average_ns_per_checkpoint: ns_samples.clone(),
         repeat_aggregate_checkpoints_per_second: throughput_samples.clone(),
@@ -719,6 +721,15 @@ fn run_concurrently(
         let completion = delta
             .completion_counts(destination)
             .ok_or_else(|| "completion counts disappeared from snapshot".to_owned())?;
+        if operation.frozen() && operation.transition() {
+            let scores = delta
+                .calibrated_online_scores(destination)
+                .map_err(|error| error.to_string())?;
+            let request_count = u128::from(checkpoints_per_writer)
+                * u128::try_from(writers).map_err(|_| "writer count does not fit u128")?;
+            assert_eq!(scores.predecessor_samples(), request_count);
+            assert_eq!(scores.first_samples(), 0);
+        }
         (
             delta.diagnostics().total(),
             samples.local(),
@@ -1077,9 +1088,9 @@ fn print_summary(report: &ScreeningReport) {
         report.environment.cpu_model
     );
     println!(
-        "protocol: {} checkpoints/writer, {} warmup, {} repeats, {} contended writers",
-        report.protocol.checkpoints_per_writer,
-        report.protocol.warmup_checkpoints_per_writer,
+        "protocol: {} requests/writer, {} warmup requests/writer, {} repeats, {} contended writers",
+        report.protocol.requests_per_writer,
+        report.protocol.warmup_requests_per_writer,
         report.protocol.repeats,
         report.protocol.contended_writers
     );
