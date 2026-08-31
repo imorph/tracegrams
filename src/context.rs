@@ -407,33 +407,26 @@ impl Tracegrams {
             default_bucketize(cumulative_ns)
         };
 
-        if let Some(index) = self.inner.layout.local(stage.index(), local_bucket) {
-            self.inner.increment(index);
-        }
-        if let Some(index) = self
-            .inner
-            .layout
-            .cumulative(stage.index(), cumulative_bucket)
-        {
-            self.inner.increment(index);
-        }
+        self.inner
+            .increment(self.inner.layout.local_index(stage.index(), local_bucket));
+        self.inner.increment(
+            self.inner
+                .layout
+                .cumulative_index(stage.index(), cumulative_bucket),
+        );
 
         if let Some(previous) = previous {
             let previous_bucket = usize::from(previous.cumulative_bucket);
-            if let Some(index) =
-                self.inner
-                    .layout
-                    .cause(stage.index(), previous_bucket, local_bucket)
-            {
-                self.inner.increment(index);
-            }
-            if let Some(index) =
-                self.inner
-                    .layout
-                    .incoming(stage.index(), previous_bucket, cumulative_bucket)
-            {
-                self.inner.increment(index);
-            }
+            self.inner.increment(self.inner.layout.cause_index(
+                stage.index(),
+                previous_bucket,
+                local_bucket,
+            ));
+            self.inner.increment(self.inner.layout.incoming_index(
+                stage.index(),
+                previous_bucket,
+                cumulative_bucket,
+            ));
         }
 
         match self.inner.calibration_state.load(Ordering::Acquire) {
@@ -444,32 +437,26 @@ impl Tracegrams {
                 } else {
                     calibration_bucketize(cumulative_ns, cumulative_bucket)
                 };
-                if let Some(index) = self.inner.layout.calibration(
+                self.inner.increment(self.inner.layout.calibration_index(
                     stage.index(),
                     CalibrationDistribution::Local,
                     calibration_local,
-                ) {
-                    self.inner.increment(index);
-                }
-                if let Some(index) = self.inner.layout.calibration(
+                ));
+                self.inner.increment(self.inner.layout.calibration_index(
                     stage.index(),
                     CalibrationDistribution::CumulativeAfter,
                     calibration_after,
-                ) {
-                    self.inner.increment(index);
-                }
+                ));
                 if let Some(previous) = previous {
                     let calibration_previous = calibration_bucketize(
                         previous_cumulative_ns,
                         usize::from(previous.cumulative_bucket),
                     );
-                    if let Some(index) = self.inner.layout.calibration(
+                    self.inner.increment(self.inner.layout.calibration_index(
                         stage.index(),
                         CalibrationDistribution::PreviousCumulative,
                         calibration_previous,
-                    ) {
-                        self.inner.increment(index);
-                    }
+                    ));
                 }
             }
             CALIBRATION_FREEZING => self
@@ -491,9 +478,8 @@ impl Tracegrams {
                 Outcome::Success => false,
                 Outcome::Error => true,
             };
-            if let Some(index) = self.inner.layout.completion(stage.index(), error) {
-                self.inner.increment(index);
-            }
+            self.inner
+                .increment(self.inner.layout.completion_index(stage.index(), error));
         }
 
         MarkAdvance {
@@ -543,11 +529,7 @@ impl Tracegrams {
         } else {
             first_online_counter(local_tail, cumulative_after_tail)
         };
-        let index = self
-            .inner
-            .layout
-            .online(stage.index(), counter)
-            .expect("registered stage and truth-table cell have fixed storage");
+        let index = self.inner.layout.online_index(stage.index(), counter);
         self.inner.increment(index);
     }
 }

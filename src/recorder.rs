@@ -167,8 +167,16 @@ impl FixedStorageLayout {
         self.matrix.local(stage, bucket)
     }
 
+    pub(crate) fn local_index(self, stage: usize, bucket: usize) -> usize {
+        self.matrix.local_index(stage, bucket)
+    }
+
     pub(crate) fn cumulative(self, stage: usize, bucket: usize) -> Option<usize> {
         self.matrix.cumulative(stage, bucket)
+    }
+
+    pub(crate) fn cumulative_index(self, stage: usize, bucket: usize) -> usize {
+        self.matrix.cumulative_index(stage, bucket)
     }
 
     pub(crate) fn cause(
@@ -180,6 +188,16 @@ impl FixedStorageLayout {
         self.matrix.cause(destination, previous_cumulative, local)
     }
 
+    pub(crate) fn cause_index(
+        self,
+        destination: usize,
+        previous_cumulative: usize,
+        local: usize,
+    ) -> usize {
+        self.matrix
+            .cause_index(destination, previous_cumulative, local)
+    }
+
     pub(crate) fn incoming(
         self,
         destination: usize,
@@ -188,6 +206,16 @@ impl FixedStorageLayout {
     ) -> Option<usize> {
         self.matrix
             .incoming(destination, previous_cumulative, cumulative_after)
+    }
+
+    pub(crate) fn incoming_index(
+        self,
+        destination: usize,
+        previous_cumulative: usize,
+        cumulative_after: usize,
+    ) -> usize {
+        self.matrix
+            .incoming_index(destination, previous_cumulative, cumulative_after)
     }
 
     pub(crate) fn calibration(
@@ -209,6 +237,20 @@ impl FixedStorageLayout {
             .checked_add(bucket)
     }
 
+    pub(crate) fn calibration_index(
+        self,
+        stage: usize,
+        distribution: CalibrationDistribution,
+        bucket: usize,
+    ) -> usize {
+        debug_assert!(stage < self.stage_count);
+        debug_assert!(bucket < CALIBRATION_BUCKETS);
+        self.calibration_start
+            + (stage * CALIBRATION_DISTRIBUTIONS_PER_STAGE + distribution.offset())
+                * CALIBRATION_BUCKETS
+            + bucket
+    }
+
     pub(crate) fn online(self, stage: usize, counter: usize) -> Option<usize> {
         if stage >= self.stage_count || counter >= ONLINE_COUNTERS_PER_STAGE {
             return None;
@@ -218,6 +260,12 @@ impl FixedStorageLayout {
             .checked_add(counter)
     }
 
+    pub(crate) fn online_index(self, stage: usize, counter: usize) -> usize {
+        debug_assert!(stage < self.stage_count);
+        debug_assert!(counter < ONLINE_COUNTERS_PER_STAGE);
+        self.online_start + stage * ONLINE_COUNTERS_PER_STAGE + counter
+    }
+
     pub(crate) fn completion(self, stage: usize, error: bool) -> Option<usize> {
         if stage >= self.stage_count {
             return None;
@@ -225,6 +273,11 @@ impl FixedStorageLayout {
         self.completion_start
             .checked_add(stage.checked_mul(COMPLETION_COUNTERS_PER_STAGE)?)?
             .checked_add(usize::from(error))
+    }
+
+    pub(crate) fn completion_index(self, stage: usize, error: bool) -> usize {
+        debug_assert!(stage < self.stage_count);
+        self.completion_start + stage * COMPLETION_COUNTERS_PER_STAGE + usize::from(error)
     }
 
     pub(crate) fn diagnostic(self, diagnostic: DiagnosticCounter) -> usize {

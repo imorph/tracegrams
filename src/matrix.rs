@@ -50,8 +50,16 @@ impl StorageLayout {
         self.distribution_index(0, stage, bucket)
     }
 
+    pub(crate) fn local_index(self, stage: usize, bucket: usize) -> usize {
+        self.distribution_index_unchecked(0, stage, bucket)
+    }
+
     pub(crate) fn cumulative(self, stage: usize, bucket: usize) -> Option<usize> {
         self.distribution_index(self.distribution_cells, stage, bucket)
+    }
+
+    pub(crate) fn cumulative_index(self, stage: usize, bucket: usize) -> usize {
+        self.distribution_index_unchecked(self.distribution_cells, stage, bucket)
     }
 
     pub(crate) fn cause(
@@ -61,6 +69,15 @@ impl StorageLayout {
         local: usize,
     ) -> Option<usize> {
         self.matrix_index(self.cause_start, destination, previous_cumulative, local)
+    }
+
+    pub(crate) fn cause_index(
+        self,
+        destination: usize,
+        previous_cumulative: usize,
+        local: usize,
+    ) -> usize {
+        self.matrix_index_unchecked(self.cause_start, destination, previous_cumulative, local)
     }
 
     pub(crate) fn incoming(
@@ -83,6 +100,21 @@ impl StorageLayout {
         )
     }
 
+    pub(crate) fn incoming_index(
+        self,
+        destination: usize,
+        previous_cumulative: usize,
+        cumulative_after: usize,
+    ) -> usize {
+        debug_assert!(destination > 0);
+        self.matrix_index_unchecked(
+            self.incoming_start,
+            destination - 1,
+            previous_cumulative,
+            cumulative_after,
+        )
+    }
+
     fn distribution_index(self, start: usize, stage: usize, bucket: usize) -> Option<usize> {
         if stage >= self.stage_count || bucket >= BUCKETS {
             return None;
@@ -90,6 +122,12 @@ impl StorageLayout {
         start
             .checked_add(stage.checked_mul(BUCKETS)?)?
             .checked_add(bucket)
+    }
+
+    fn distribution_index_unchecked(self, start: usize, stage: usize, bucket: usize) -> usize {
+        debug_assert!(stage < self.stage_count);
+        debug_assert!(bucket < BUCKETS);
+        start + stage * BUCKETS + bucket
     }
 
     fn matrix_index(self, start: usize, matrix: usize, row: usize, column: usize) -> Option<usize> {
@@ -100,6 +138,19 @@ impl StorageLayout {
             .checked_add(matrix.checked_mul(MATRIX_CELLS)?)?
             .checked_add(row.checked_mul(BUCKETS)?)?
             .checked_add(column)
+    }
+
+    fn matrix_index_unchecked(
+        self,
+        start: usize,
+        matrix: usize,
+        row: usize,
+        column: usize,
+    ) -> usize {
+        debug_assert!(matrix < self.stage_count);
+        debug_assert!(row < BUCKETS);
+        debug_assert!(column < BUCKETS);
+        start + matrix * MATRIX_CELLS + row * BUCKETS + column
     }
 }
 
