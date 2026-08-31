@@ -107,6 +107,7 @@ impl StorageLayout {
         cumulative_after: usize,
     ) -> usize {
         debug_assert!(destination > 0);
+        debug_assert!(destination < self.stage_count);
         self.matrix_index_unchecked(
             self.incoming_start,
             destination - 1,
@@ -224,6 +225,45 @@ mod tests {
         assert_eq!(max.counter_bytes(), Some(4_227_072));
         assert_eq!(StorageLayout::new(0), None);
         assert_eq!(StorageLayout::new(usize::MAX), None);
+    }
+
+    #[test]
+    fn infallible_indexes_agree_with_checked_indexes_on_every_valid_input() {
+        let stages = 3;
+        let layout = StorageLayout::new(stages).unwrap();
+
+        for stage in 0..stages {
+            for bucket in 0..BUCKETS {
+                assert_eq!(
+                    layout.local(stage, bucket).unwrap(),
+                    layout.local_index(stage, bucket)
+                );
+                assert_eq!(
+                    layout.cumulative(stage, bucket).unwrap(),
+                    layout.cumulative_index(stage, bucket)
+                );
+            }
+            for previous in 0..BUCKETS {
+                for local in 0..BUCKETS {
+                    assert_eq!(
+                        layout.cause(stage, previous, local).unwrap(),
+                        layout.cause_index(stage, previous, local)
+                    );
+                }
+            }
+        }
+        for destination in 1..stages {
+            for previous in 0..BUCKETS {
+                for cumulative_after in 0..BUCKETS {
+                    assert_eq!(
+                        layout
+                            .incoming(destination, previous, cumulative_after)
+                            .unwrap(),
+                        layout.incoming_index(destination, previous, cumulative_after)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
