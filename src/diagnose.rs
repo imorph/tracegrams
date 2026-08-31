@@ -42,13 +42,13 @@ pub enum ScorePopulation {
 pub enum ScoreStatus {
     /// The numerator, denominator, and ratio are available.
     Available,
-    /// No predecessor-bearing samples were observed for the required matrix.
+    /// No predecessor-bearing samples were available for this score.
     NoPredecessorPopulation,
     /// The score's denominator is zero.
     ZeroDenominator,
     /// Relaxed inputs violated a probability invariant.
     InconsistentSnapshot,
-    /// Exact threshold or ratio arithmetic exceeded its supported integer range.
+    /// Threshold or ratio arithmetic exceeded its supported integer range.
     ArithmeticOverflow,
 }
 
@@ -102,7 +102,7 @@ impl MatrixThresholds {
     }
 }
 
-/// One numeric matrix-derived score and its exact aggregate counts.
+/// One numeric matrix-derived score and its integer rational terms.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MatrixScore {
     numerator: u128,
@@ -122,12 +122,12 @@ impl MatrixScore {
         self.status
     }
 
-    /// Returns the exact aggregate numerator observed in the snapshot.
+    /// Returns the integer numerator of this score's ratio.
     pub const fn numerator(self) -> u128 {
         self.numerator
     }
 
-    /// Returns the exact aggregate denominator observed in the snapshot.
+    /// Returns the integer denominator of this score's ratio.
     pub const fn denominator(self) -> u128 {
         self.denominator
     }
@@ -653,7 +653,7 @@ fn score_ratio(numerator: u128, denominator: u128) -> ScoreParts {
     }
 }
 
-/// Exact frozen thresholds used by one calibrated-online stage report.
+/// Frozen nanosecond thresholds used by one calibrated-online stage report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CalibratedThresholds {
     local: u64,
@@ -662,23 +662,23 @@ pub struct CalibratedThresholds {
 }
 
 impl CalibratedThresholds {
-    /// Returns the exact local-tail predicate threshold.
+    /// Returns the frozen local-tail predicate threshold.
     pub const fn local_ns(self) -> u64 {
         self.local
     }
 
-    /// Returns the exact previous-cumulative predicate threshold when calibrated.
+    /// Returns the frozen previous-cumulative predicate threshold when calibrated.
     pub const fn previous_cumulative_ns(self) -> Option<u64> {
         self.previous_cumulative
     }
 
-    /// Returns the exact cumulative-after-tail predicate threshold.
+    /// Returns the frozen cumulative-after-tail predicate threshold.
     pub const fn cumulative_after_ns(self) -> u64 {
         self.cumulative_after
     }
 }
 
-/// One exact calibrated-online score and its aggregate rational terms.
+/// One calibrated-online score and its integer rational terms.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CalibratedOnlineScore {
     numerator: u128,
@@ -698,12 +698,12 @@ impl CalibratedOnlineScore {
         self.status
     }
 
-    /// Returns the exact aggregate numerator observed in the snapshot.
+    /// Returns the integer numerator of this score's ratio.
     pub const fn numerator(self) -> u128 {
         self.numerator
     }
 
-    /// Returns the exact aggregate denominator observed in the snapshot.
+    /// Returns the integer denominator of this score's ratio.
     pub const fn denominator(self) -> u128 {
         self.denominator
     }
@@ -790,7 +790,7 @@ impl CalibratedOnlineScores {
         self.epoch
     }
 
-    /// Returns the exact frozen thresholds.
+    /// Returns the frozen thresholds.
     pub const fn thresholds(self) -> CalibratedThresholds {
         self.thresholds
     }
@@ -815,7 +815,7 @@ impl CalibratedOnlineScores {
         self.local_tail_origin_clean
     }
 
-    /// Returns `P(previous tail | local tail)` for predecessor marks.
+    /// Returns `P(previous tail | local tail)`; first marks count only in the denominator.
     pub const fn local_tail_origin_tail(self) -> CalibratedOnlineScore {
         self.local_tail_origin_tail
     }
@@ -1004,11 +1004,11 @@ fn online_totals(counts: &[u64]) -> OnlineTotals {
 /// Named classification thresholds. There is deliberately no [`Default`] policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiagnoseConfig {
-    /// Minimum calibrated `tail_onset` score for [`Classification::Onset`].
+    /// Minimum `tail_onset` score for [`Classification::Onset`].
     pub onset_threshold: f64,
-    /// Minimum calibrated `amplification_lift` for [`Classification::Amplifier`].
+    /// Minimum `amplification_lift` for [`Classification::Amplifier`].
     pub amplification_lift_threshold: f64,
-    /// Minimum calibrated `carry_through` score for [`Classification::CarryThrough`].
+    /// Minimum `carry_through` score for [`Classification::CarryThrough`].
     pub carry_through_threshold: f64,
 }
 
@@ -1029,17 +1029,18 @@ impl DiagnoseConfig {
     }
 }
 
-/// Secondary convenience label derived from the numeric calibrated scores.
+/// Secondary convenience label applied in onset, amplifier, carry-through
+/// precedence; the first score meeting its threshold wins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Classification {
-    /// Tail latency primarily appears at this stage.
+    /// The tail-onset score met its threshold.
     Onset,
-    /// Existing tail latency makes local tail work substantially more likely.
+    /// The amplification-lift score met its threshold; tail onset did not.
     Amplifier,
-    /// Existing tail latency passes through without local tail work.
+    /// The carry-through score met its threshold; higher-precedence scores did not.
     CarryThrough,
-    /// Available scores do not satisfy one unambiguous classification.
+    /// No available score met its classification threshold.
     Inconclusive,
 }
 
