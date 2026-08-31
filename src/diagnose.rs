@@ -1013,10 +1013,19 @@ fn online_totals(counts: &[u64]) -> OnlineTotals {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiagnoseConfig {
     /// Minimum `tail_onset` score for [`Classification::Onset`].
+    ///
+    /// `NaN` is never met. Negative values are accepted and are met by any
+    /// available nonnegative score.
     pub onset_threshold: f64,
     /// Minimum `amplification_lift` for [`Classification::Amplifier`].
+    ///
+    /// `NaN` is never met. Negative values are accepted and are met by any
+    /// available nonnegative lift.
     pub amplification_lift_threshold: f64,
     /// Minimum `carry_through` score for [`Classification::CarryThrough`].
+    ///
+    /// `NaN` is never met. Negative values are accepted and are met by any
+    /// available nonnegative score.
     pub carry_through_threshold: f64,
 }
 
@@ -1266,11 +1275,17 @@ fn classify_values(
     carry_through: Option<f64>,
     config: DiagnoseConfig,
 ) -> Classification {
-    if tail_onset.is_some_and(|value| value >= config.onset_threshold) {
+    if !config.onset_threshold.is_nan()
+        && tail_onset.is_some_and(|value| value >= config.onset_threshold)
+    {
         Classification::Onset
-    } else if amplification_lift.is_some_and(|value| value >= config.amplification_lift_threshold) {
+    } else if !config.amplification_lift_threshold.is_nan()
+        && amplification_lift.is_some_and(|value| value >= config.amplification_lift_threshold)
+    {
         Classification::Amplifier
-    } else if carry_through.is_some_and(|value| value >= config.carry_through_threshold) {
+    } else if !config.carry_through_threshold.is_nan()
+        && carry_through.is_some_and(|value| value >= config.carry_through_threshold)
+    {
         Classification::CarryThrough
     } else {
         Classification::Inconclusive
@@ -1592,6 +1607,66 @@ mod tests {
         assert_eq!(
             scores.tail_onset().status(),
             ScoreStatus::ArithmeticOverflow
+        );
+    }
+
+    #[test]
+    fn nan_classification_thresholds_are_never_met() {
+        let classify = |config| classify_values(Some(1.0), Some(1.0), Some(1.0), config);
+
+        assert_eq!(
+            classify(DiagnoseConfig {
+                onset_threshold: f64::NAN,
+                amplification_lift_threshold: 0.5,
+                carry_through_threshold: 0.5,
+            }),
+            Classification::Amplifier
+        );
+        assert_eq!(
+            classify(DiagnoseConfig {
+                onset_threshold: f64::NAN,
+                amplification_lift_threshold: f64::NAN,
+                carry_through_threshold: 0.5,
+            }),
+            Classification::CarryThrough
+        );
+        assert_eq!(
+            classify(DiagnoseConfig {
+                onset_threshold: f64::NAN,
+                amplification_lift_threshold: f64::NAN,
+                carry_through_threshold: f64::NAN,
+            }),
+            Classification::Inconclusive
+        );
+    }
+
+    #[test]
+    fn negative_classification_thresholds_are_accepted_minima() {
+        let classify = |config| classify_values(Some(0.0), Some(0.0), Some(0.0), config);
+
+        assert_eq!(
+            classify(DiagnoseConfig {
+                onset_threshold: -1.0,
+                amplification_lift_threshold: f64::NAN,
+                carry_through_threshold: f64::NAN,
+            }),
+            Classification::Onset
+        );
+        assert_eq!(
+            classify(DiagnoseConfig {
+                onset_threshold: f64::NAN,
+                amplification_lift_threshold: -1.0,
+                carry_through_threshold: f64::NAN,
+            }),
+            Classification::Amplifier
+        );
+        assert_eq!(
+            classify(DiagnoseConfig {
+                onset_threshold: f64::NAN,
+                amplification_lift_threshold: f64::NAN,
+                carry_through_threshold: -1.0,
+            }),
+            Classification::CarryThrough
         );
     }
 }
