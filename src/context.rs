@@ -27,6 +27,8 @@ struct PreviousMark {
     cumulative_bucket: u8,
 }
 
+// Pack recorder identity, calibration epoch, and the previous mark into one
+// word so `Ctx` stays at three `u64`s.
 const COOKIE_MASK: u64 = 0xffff_ffff;
 const CALIBRATION_EPOCH_SHIFT: u32 = 32;
 const PREVIOUS_STAGE_SHIFT: u32 = 48;
@@ -490,6 +492,8 @@ impl Tracegrams {
         local_ns: u64,
         cumulative_after_ns: u64,
     ) {
+        // Requests started before threshold publication do not belong to the
+        // frozen epoch; classifying them would mix populations.
         let frozen_epoch = self.inner.calibration_epoch.load(Ordering::Relaxed);
         if context_calibration_epoch != frozen_epoch {
             return;

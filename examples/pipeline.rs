@@ -1,4 +1,4 @@
-//! Minimal collect-freeze-diagnose flow for a linear pipeline.
+//! Collect-freeze-diagnose flow with request recording factored into a helper.
 
 use std::error::Error;
 use std::time::Duration;

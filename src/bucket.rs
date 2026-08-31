@@ -69,6 +69,8 @@ const DEFAULT_BOUNDS: [u64; BUCKETS - 1] = [
     10_000_000_000,
 ];
 
+// Each finite ordinary interval is split into four geometric calibration
+// buckets, so a calibration bucket can be located from its ordinary bucket.
 const CALIBRATION_BOUNDS: [u64; CALIBRATION_BUCKETS - 1] = [
     100,
     108,
@@ -349,6 +351,8 @@ pub(crate) fn calibration_bucketize(value: u64, default_bucket: usize) -> usize 
         return CALIBRATION_BUCKETS - 1;
     }
 
+    // Search only the four calibration buckets nested inside the already
+    // known ordinary bucket.
     let first = 1 + (default_bucket - 1) * 4;
     first + CALIBRATION_BOUNDS[first..first + 3].partition_point(|&bound| value >= bound)
 }
@@ -417,6 +421,8 @@ pub(crate) fn nearest_rank(
     unreachable!("the checked total must be reached by its source counts");
 }
 
+// Computes `ceil(samples * quantile)` from the exact binary value of the
+// `f64`, avoiding float rounding at rank boundaries.
 fn quantile_rank(samples: u64, quantile: f64) -> u128 {
     let bits = quantile.to_bits();
     let exponent = ((bits >> 52) & 0x7ff) as u16;
@@ -484,6 +490,7 @@ pub(crate) fn estimate_quantile(
     }))
 }
 
+// The harmonic mean equalizes worst-case relative error at both bucket edges.
 pub(crate) fn finite_representative(lower: u64, upper: u64) -> Option<u64> {
     if lower >= upper {
         return None;

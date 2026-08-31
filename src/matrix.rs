@@ -69,6 +69,8 @@ impl StorageLayout {
         previous_cumulative: usize,
         cumulative_after: usize,
     ) -> Option<usize> {
+        // The first registered stage cannot have a predecessor, so incoming
+        // storage omits its matrix.
         let matrix = destination.checked_sub(1)?;
         if destination >= self.stage_count {
             return None;

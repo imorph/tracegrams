@@ -611,6 +611,8 @@ fn score_probability(numerator: u128, denominator: u128) -> ScoreParts {
     score_ratio(numerator, denominator)
 }
 
+// Cross-multiplies the two rates to keep the ratio in integer terms until
+// the final `f64` conversion.
 fn score_lift(
     tail_local_tail: u128,
     previous_tail: u128,
@@ -954,6 +956,8 @@ fn derive_calibrated_online_scores(
     })
 }
 
+// Cell indices encode cumulative-after/local/previous tail as bits 0/1/2;
+// first-mark cells use only bits 0 and 1.
 fn online_totals(counts: &[u64]) -> OnlineTotals {
     let mut totals = OnlineTotals::default();
     for (cell, count) in counts.iter().copied().enumerate() {

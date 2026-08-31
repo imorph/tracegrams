@@ -535,6 +535,8 @@ impl Tracegrams {
         stages: &[StageId],
         minimum_samples: u64,
     ) -> Result<FreezeReport, FreezeError> {
+        // Re-scan after claiming the transition; any readiness observed
+        // before the claim may be stale.
         let scans = self.scan_calibration(stages);
         let readiness = readiness_from_scans(&scans, minimum_samples);
         if !readiness.is_ready() {
@@ -564,6 +566,8 @@ impl Tracegrams {
             });
         }
 
+        // Build a clean online epoch: reset cells and publish thresholds
+        // before the release store below exposes the frozen state.
         for index in self.inner.layout.online_start()
             ..self.inner.layout.online_start() + self.inner.layout.online_counter_count()
         {

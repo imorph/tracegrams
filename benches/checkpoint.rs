@@ -1,10 +1,10 @@
 //! Checkpoint overhead, contention, snapshot, and memory screening harness.
 //!
 //! Timings are medians of aggregate-repeat averages, never per-operation
-//! percentiles. Every measured checkpoint uses a fresh context and one
-//! finish-only mark, so all writers target the same counter cells. The clocked
-//! cell conservatively includes the request-start clock read as well as the
-//! finish checkpoint clock read.
+//! percentiles. Instrumented cells use a fresh context and one finish-only
+//! mark; hot-bucket writers contend on the same counter cells, while the
+//! bucket-spread pattern scatters writes across buckets. Clocked cells
+//! include both the request-start and finish clock reads.
 
 #![allow(
     clippy::cast_precision_loss,
