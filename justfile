@@ -46,13 +46,22 @@ doc:
 
 # Check the exact minimum supported Rust version.
 msrv-check:
-    cargo +{{ msrv }} check --locked --all-features
+    cargo +{{ msrv }} check --locked --all-features --all-targets
 
 # Check minimum dependency versions.
+[unix]
 minimal-versions:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lockfile_backup="$(mktemp)"
+    cp Cargo.lock "$lockfile_backup"
+    trap 'cp "$lockfile_backup" Cargo.lock; rm -f "$lockfile_backup"' EXIT
     cargo +nightly generate-lockfile -Zminimal-versions
-    cargo +nightly check --locked --all-features
-    git checkout -- Cargo.lock
+    cargo +nightly check --locked --all-features --all-targets
+
+[windows]
+minimal-versions:
+    $ErrorActionPreference = 'Stop'; $lockfileBackup = [System.IO.Path]::GetTempFileName(); Copy-Item Cargo.lock $lockfileBackup; try { cargo +nightly generate-lockfile -Zminimal-versions; if ($LASTEXITCODE -ne 0) { throw "cargo generate-lockfile failed with exit code $LASTEXITCODE" }; cargo +nightly check --locked --all-features --all-targets; if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" } } finally { Copy-Item $lockfileBackup Cargo.lock -Force; Remove-Item $lockfileBackup -Force }
 
 # Check dependency licenses, bans, and sources.
 deny:
@@ -67,10 +76,19 @@ deny-advisories:
     cargo deny check advisories
 
 # Test the latest dependency versions.
+[unix]
 test-latest-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lockfile_backup="$(mktemp)"
+    cp Cargo.lock "$lockfile_backup"
+    trap 'cp "$lockfile_backup" Cargo.lock; rm -f "$lockfile_backup"' EXIT
     cargo update
     cargo test --all-features --all-targets
-    git checkout -- Cargo.lock
+
+[windows]
+test-latest-deps:
+    $ErrorActionPreference = 'Stop'; $lockfileBackup = [System.IO.Path]::GetTempFileName(); Copy-Item Cargo.lock $lockfileBackup; try { cargo update; if ($LASTEXITCODE -ne 0) { throw "cargo update failed with exit code $LASTEXITCODE" }; cargo test --all-features --all-targets; if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" } } finally { Copy-Item $lockfileBackup Cargo.lock -Force; Remove-Item $lockfileBackup -Force }
 
 # Run benchmarks.
 bench:
