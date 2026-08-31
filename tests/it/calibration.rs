@@ -194,6 +194,33 @@ fn selected_stage_freeze_leaves_excluded_stages_uncalibrated() {
 }
 
 #[test]
+fn selected_stage_report_follows_registration_order() {
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let second = builder.stage("second").unwrap();
+    let third = builder.stage("third").unwrap();
+    let tracegrams = builder.build().unwrap();
+    let mut context = tracegrams.start_manual();
+    tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
+    tracegrams.record_elapsed(&mut context, second, Duration::from_nanos(100));
+    tracegrams.record_elapsed(&mut context, third, Duration::from_nanos(100));
+
+    let report = tracegrams
+        .try_freeze_calibration(FreezeCriteria::for_stages(&[third, first], 1))
+        .unwrap();
+
+    assert_eq!(
+        report
+            .stages()
+            .iter()
+            .copied()
+            .map(tracegrams::StageCalibrationReport::stage)
+            .collect::<Vec<_>>(),
+        vec![first, third]
+    );
+}
+
+#[test]
 fn lower_terminal_failure_retains_a_report_and_allows_finite_retry() {
     let mut builder = Tracegrams::builder();
     let stage = builder.stage("stage").unwrap();

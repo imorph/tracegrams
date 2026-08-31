@@ -844,6 +844,55 @@ mod tests {
     use crate::bucket::bucketize;
 
     #[test]
+    fn arithmetic_overflow_restores_collecting_without_publication() {
+        let mut builder = Tracegrams::builder();
+        let stage = builder.stage("stage").unwrap();
+        let tracegrams = builder.build().unwrap();
+        tracegrams.record_elapsed(
+            &mut tracegrams.start_manual(),
+            stage,
+            Duration::from_nanos(100),
+        );
+
+        for (bucket, count) in [(1, u64::MAX), (2, 1)] {
+            let index = tracegrams
+                .inner
+                .layout
+                .calibration(stage.index(), CalibrationDistribution::Local, bucket)
+                .unwrap();
+            tracegrams.inner.counters[index].store(count, Ordering::Relaxed);
+        }
+        tracegrams
+            .inner
+            .calibration_state
+            .store(CALIBRATION_FREEZING, Ordering::Release);
+
+        assert!(matches!(
+            tracegrams.freeze_after_claim(&[stage], 1),
+            Err(FreezeError::CalibrationArithmeticOverflow {
+                stage: overflow_stage,
+                population: crate::snapshot::CalibrationPopulation::Local,
+            }) if overflow_stage == stage
+        ));
+        assert!(tracegrams.frozen_calibration_report().is_none());
+        assert_eq!(
+            tracegrams.inner.calibration_epoch.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            tracegrams.inner.calibration_state.load(Ordering::Acquire),
+            CALIBRATION_COLLECTING
+        );
+        assert!(
+            tracegrams
+                .inner
+                .frozen_calibration
+                .iter()
+                .all(|published| published.get().is_none())
+        );
+    }
+
+    #[test]
     fn revalidation_rejects_an_absent_to_insufficient_previous_population_race() {
         let mut builder = Tracegrams::builder();
         let _first = builder.stage("first").unwrap();

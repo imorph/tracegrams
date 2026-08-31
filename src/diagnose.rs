@@ -1006,6 +1006,7 @@ fn online_totals(counts: &[u64]) -> OnlineTotals {
 }
 
 /// Named classification thresholds. There is deliberately no [`Default`] policy.
+/// When multiple thresholds pass, onset takes precedence over amplifier, then carry-through.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DiagnoseConfig {
     /// Minimum `tail_onset` score for [`Classification::Onset`].

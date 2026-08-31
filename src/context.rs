@@ -162,6 +162,31 @@ struct MarkAdvance {
 ///
 /// A manual context is tied to the recorder that created it. It is neither
 /// cloneable nor convertible to the clock-reading context.
+///
+/// `ManualCtx` is intentionally not [`Clone`]:
+///
+/// ```compile_fail
+/// use tracegrams::Tracegrams;
+///
+/// let mut builder = Tracegrams::builder();
+/// builder.stage("only").unwrap();
+/// let tracegrams = builder.build().unwrap();
+/// let context = tracegrams.start_manual();
+/// let _duplicate = context.clone();
+/// ```
+///
+/// Nor is it [`Copy`]:
+///
+/// ```compile_fail
+/// use tracegrams::Tracegrams;
+///
+/// let mut builder = Tracegrams::builder();
+/// builder.stage("only").unwrap();
+/// let tracegrams = builder.build().unwrap();
+/// let context = tracegrams.start_manual();
+/// let _moved = context;
+/// let _used_again = context;
+/// ```
 pub struct ManualCtx {
     cumulative_ns: u64,
     cookie: RegistryCookie,

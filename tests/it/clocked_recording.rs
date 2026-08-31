@@ -31,6 +31,12 @@ fn clocked_request_records_increasing_and_skipped_stages() {
     tracegrams.mark(&mut context, parse);
     tracegrams.mark(&mut context, db);
     tracegrams.finish(context, render, Outcome::Success);
+
+    let snapshot = tracegrams.snapshot_relaxed();
+    assert_eq!(snapshot.sample_counts(parse).unwrap().local(), 1);
+    assert_eq!(snapshot.sample_counts(db).unwrap().local(), 1);
+    assert_eq!(snapshot.sample_counts(render).unwrap().local(), 1);
+    assert_eq!(snapshot.completion_counts(render).unwrap().success(), 1);
 }
 
 #[test]

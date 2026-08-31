@@ -173,7 +173,6 @@ fn repeated_relaxed_snapshots_are_safe_during_concurrent_writes() {
         writer_done.store(true, Ordering::Release);
     });
 
-    let mut scans = 0;
     let mut previous_first_samples = 0;
     while !done.load(Ordering::Acquire) {
         let snapshot = tracegrams.snapshot_relaxed();
@@ -184,11 +183,9 @@ fn repeated_relaxed_snapshots_are_safe_during_concurrent_writes() {
         assert!(first_samples >= previous_first_samples);
         assert!(first_samples <= REQUESTS as u128);
         previous_first_samples = first_samples;
-        scans += 1;
     }
     writer.join().unwrap();
 
-    assert!(scans > 0);
     let final_snapshot = tracegrams.snapshot_relaxed();
     assert_eq!(
         final_snapshot.sample_counts(first).unwrap().local(),

@@ -543,6 +543,49 @@ fn diagnosis_requires_calibration_and_classifies_from_numeric_scores() {
 }
 
 #[test]
+fn classification_prefers_onset_then_amplifier_then_carry_through() {
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let destination = builder.stage("destination").unwrap();
+    builder.tail_quantile(0.91).unwrap();
+    let tracegrams = builder.build().unwrap();
+
+    for (previous_ns, local_ns, count) in [
+        (100, 100, 80),
+        (100, 1_000_000, 10),
+        (1_000_000, 100, 5),
+        (1_000_000, 1_000_000, 5),
+    ] {
+        for _ in 0..count {
+            let mut context = tracegrams.start_manual();
+            tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(previous_ns));
+            tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(local_ns));
+        }
+    }
+    let scores = tracegrams
+        .snapshot_relaxed()
+        .matrix_scores(destination)
+        .unwrap();
+
+    let all_pass = DiagnoseConfig {
+        onset_threshold: 0.5,
+        amplification_lift_threshold: 4.0,
+        carry_through_threshold: 0.5,
+    };
+    assert_eq!(scores.classification(&all_pass), Classification::Onset);
+
+    let amplifier_and_carry_pass = DiagnoseConfig {
+        onset_threshold: 0.6,
+        amplification_lift_threshold: 4.0,
+        carry_through_threshold: 0.5,
+    };
+    assert_eq!(
+        scores.classification(&amplifier_and_carry_pass),
+        Classification::Amplifier
+    );
+}
+
+#[test]
 fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
     let mut builder = Tracegrams::builder();
     let stage = builder.stage("stage").unwrap();

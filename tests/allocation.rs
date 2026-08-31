@@ -75,6 +75,22 @@ fn frozen_recorder() -> (Tracegrams, StageId) {
     (tracegrams, stage)
 }
 
+fn two_stage_recorder(frozen: bool) -> (Tracegrams, StageId, StageId) {
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let second = builder.stage("second").unwrap();
+    let tracegrams = builder.build().unwrap();
+    if frozen {
+        let mut context = tracegrams.start_manual();
+        tracegrams.record_elapsed(&mut context, first, Duration::from_micros(1));
+        tracegrams.record_elapsed(&mut context, second, Duration::from_micros(1));
+        tracegrams
+            .try_freeze_calibration(FreezeCriteria::all_stages(1))
+            .unwrap();
+    }
+    (tracegrams, first, second)
+}
+
 fn assert_zero_allocations_for_hot_plane(tracegrams: &Tracegrams, stage: StageId) {
     let (mut manual, allocations) = allocations_during(|| tracegrams.start_manual());
     assert_eq!(allocations, 0, "manual request start allocated");
@@ -102,6 +118,24 @@ fn assert_zero_allocations_for_hot_plane(tracegrams: &Tracegrams, stage: StageId
     assert_eq!(allocations, 0, "clocked finish checkpoint allocated");
 }
 
+fn assert_zero_allocations_for_predecessor_updates(
+    tracegrams: &Tracegrams,
+    first: StageId,
+    second: StageId,
+) {
+    let mut manual = tracegrams.start_manual();
+    tracegrams.record_elapsed(&mut manual, first, Duration::from_micros(1));
+    let ((), allocations) = allocations_during(|| {
+        tracegrams.record_elapsed(&mut manual, second, Duration::from_micros(1));
+    });
+    assert_eq!(allocations, 0, "manual predecessor checkpoint allocated");
+
+    let mut clocked = tracegrams.start();
+    tracegrams.mark(&mut clocked, first);
+    let ((), allocations) = allocations_during(|| tracegrams.mark(&mut clocked, second));
+    assert_eq!(allocations, 0, "clocked predecessor checkpoint allocated");
+}
+
 #[test]
 fn core_starts_and_checkpoints_allocate_nothing_after_build() {
     let (collecting, collecting_stage) = one_stage_recorder();
@@ -109,4 +143,10 @@ fn core_starts_and_checkpoints_allocate_nothing_after_build() {
 
     let (frozen, frozen_stage) = frozen_recorder();
     assert_zero_allocations_for_hot_plane(&frozen, frozen_stage);
+
+    let (collecting, first, second) = two_stage_recorder(false);
+    assert_zero_allocations_for_predecessor_updates(&collecting, first, second);
+
+    let (frozen, first, second) = two_stage_recorder(true);
+    assert_zero_allocations_for_predecessor_updates(&frozen, first, second);
 }
