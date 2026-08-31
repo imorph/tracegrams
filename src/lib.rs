@@ -59,7 +59,7 @@
 //!
 //! # Consistency and scope
 //!
-//! [`Tracegrams::snapshot_relaxed`] is an eventually consistent atomic scan, not
+//! [`Tracegrams::snapshot_relaxed`] loads each cell atomically but is not
 //! a single-instant cut. Matrix-derived scores cover predecessor-bearing marks
 //! only and are explicitly labeled as a known-drift path; calibrated-online
 //! scores also preserve clean-sentinel first marks. This v0 supports one explicit

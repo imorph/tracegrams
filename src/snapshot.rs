@@ -355,12 +355,12 @@ impl Snapshot {
         Some(self.stages[stage].name())
     }
 
-    /// Returns the 63 pinned ordinary bucket bounds.
+    /// Returns the pinned ordinary bucket bounds; each bound starts the next bucket.
     pub fn bucket_bounds(&self) -> &[u64] {
         &self.bucket_bounds
     }
 
-    /// Returns the 249 pinned calibration-grid bounds.
+    /// Returns the pinned calibration-grid bounds, using the same convention.
     pub fn calibration_bucket_bounds(&self) -> &[u64] {
         &self.calibration_bucket_bounds
     }
@@ -509,6 +509,10 @@ impl Snapshot {
     }
 
     /// Purely subtracts `earlier` from this later snapshot.
+    ///
+    /// When the endpoints belong to different calibration epochs, online
+    /// counters are zeroed instead of subtracted and the window reports
+    /// [`OnlineDeltaAvailability::EpochMismatch`].
     pub fn delta(&self, earlier: &Self) -> Result<DeltaSnapshot, DeltaError> {
         if self.cookie != earlier.cookie {
             return Err(DeltaError::RegistryMismatch);
@@ -586,6 +590,8 @@ impl Snapshot {
 }
 
 /// Owned counter differences for a window between two relaxed snapshots.
+///
+/// Cross-epoch online counters are zeroed, not subtracted.
 #[derive(Clone, Debug)]
 pub struct DeltaSnapshot {
     snapshot: Snapshot,
@@ -613,12 +619,12 @@ impl DeltaSnapshot {
         self.snapshot.stage_name(stage)
     }
 
-    /// Returns the 63 pinned ordinary bucket bounds.
+    /// Returns the pinned ordinary bucket bounds; each bound starts the next bucket.
     pub fn bucket_bounds(&self) -> &[u64] {
         self.snapshot.bucket_bounds()
     }
 
-    /// Returns the 249 pinned calibration-grid bounds.
+    /// Returns the pinned calibration-grid bounds, using the same convention.
     pub fn calibration_bucket_bounds(&self) -> &[u64] {
         self.snapshot.calibration_bucket_bounds()
     }
@@ -719,7 +725,7 @@ fn sum(counts: &[u64]) -> u128 {
 }
 
 impl Tracegrams {
-    /// Atomically loads every counter into an owned relaxed snapshot.
+    /// Loads each counter atomically into an owned relaxed snapshot.
     ///
     /// The scan does not synchronize concurrent checkpoints into a
     /// single-instant cut; a racing checkpoint may be only partly visible.
