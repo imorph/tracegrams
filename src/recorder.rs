@@ -63,6 +63,8 @@ pub(crate) enum DiagnosticCounter {
     InvalidStageMarks,
     InvalidContextMarks,
     NonMonotonicMarks,
+    /// Reserved and currently never emitted: the owned-context API makes a
+    /// mark after `finish` unrepresentable. Re-evaluate this slot before 1.0.
     MarksAfterFinish,
     ClockRegressions,
     LatencyOverflows,

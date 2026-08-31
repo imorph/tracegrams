@@ -47,6 +47,9 @@ pub enum ScoreStatus {
     /// The score's denominator is zero.
     ZeroDenominator,
     /// Relaxed inputs violated a probability invariant.
+    ///
+    /// This is a defensive status and is currently unreachable through the
+    /// public API.
     InconsistentSnapshot,
     /// Threshold or ratio arithmetic exceeded its supported integer range.
     ArithmeticOverflow,

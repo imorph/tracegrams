@@ -146,6 +146,9 @@ enum FreezeSelection {
 
 impl FreezeCriteria {
     /// Selects every registered stage.
+    ///
+    /// `minimum_samples` may be zero. Empty required populations remain not
+    /// ready, while an empty previous-cumulative population is permitted.
     pub const fn all_stages(minimum_samples: u64) -> Self {
         Self {
             minimum_samples,
@@ -154,6 +157,9 @@ impl FreezeCriteria {
     }
 
     /// Selects only the supplied stages; excluded stages remain uncalibrated.
+    ///
+    /// `minimum_samples` may be zero. Empty required populations remain not
+    /// ready, while an empty previous-cumulative population is permitted.
     pub fn for_stages(stages: &[StageId], minimum_samples: u64) -> Self {
         Self {
             minimum_samples,
@@ -483,6 +489,10 @@ struct StageScan {
 
 impl Tracegrams {
     /// Reports calibration readiness for every registered stage.
+    ///
+    /// A zero minimum is permitted, but does not make an empty required
+    /// population ready. An empty previous-cumulative population is reported
+    /// as [`PopulationReadiness::AbsentNoPredecessor`].
     pub fn calibration_readiness(&self, minimum_samples: u64) -> CalibrationReadiness {
         let stages = (0..self.inner.layout.stage_count())
             .map(|index| {
@@ -496,6 +506,10 @@ impl Tracegrams {
     }
 
     /// Attempts the single explicit collecting-to-frozen transition.
+    ///
+    /// A zero minimum is permitted, but an empty required population returns
+    /// [`FreezeError::NotReady`] before this call claims the freeze
+    /// transition.
     pub fn try_freeze_calibration(
         &self,
         criteria: FreezeCriteria,
@@ -536,7 +550,13 @@ impl Tracegrams {
         minimum_samples: u64,
     ) -> Result<FreezeReport, FreezeError> {
         // Re-scan after claiming the transition; any readiness observed
-        // before the claim may be stale.
+        // before the claim may be stale. Writers that observed Collecting can
+        // interleave their two or three increments with this relaxed scan
+        // (first marks skip the previous-cumulative cell), so cells
+        // may represent different effective request sets. The freeze contract
+        // promises per-cell atomicity only: thresholds are statistical
+        // estimates over approximately coincident populations, not a
+        // cross-cell-consistent snapshot.
         let scans = self.scan_calibration(stages);
         let readiness = readiness_from_scans(&scans, minimum_samples);
         if !readiness.is_ready() {
