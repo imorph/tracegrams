@@ -2,7 +2,7 @@
 
 Tracking Tail Latency Propagation Without Storing Traces
 
-![Tracegrams latency propagation demo](assets/tracegrams-demo.gif)
+![Tracegrams latency propagation demo](https://raw.githubusercontent.com/imorph/tracegrams/main/assets/tracegrams-demo.gif)
 
 Histograms are cheap to maintain and great at showing aggregate latency, but they do not explain why requests got slow. Traces preserve the full causal story of a single request, but at scale they are expensive, can hurt the hot path and are hard to aggregate, sample, and retain.
 

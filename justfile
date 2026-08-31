@@ -31,6 +31,10 @@ test:
     cargo test --locked --all-features --all-targets
     cargo test --locked --all-features --doc
 
+# Build and verify the packaged crate.
+package-check:
+    cargo package --allow-dirty --locked
+
 # Build documentation using the docs.rs configuration.
 [unix]
 doc:
@@ -73,4 +77,4 @@ bench:
     cargo bench
 
 # Run all blocking checks.
-all: fmt-check clippy test doc msrv-check minimal-versions deny actions-check
+all: fmt-check clippy test package-check doc msrv-check minimal-versions deny actions-check
