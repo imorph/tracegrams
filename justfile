@@ -84,11 +84,11 @@ test-latest-deps:
     cp Cargo.lock "$lockfile_backup"
     trap 'cp "$lockfile_backup" Cargo.lock; rm -f "$lockfile_backup"' EXIT
     cargo update
-    cargo test --all-features --all-targets
+    just test
 
 [windows]
 test-latest-deps:
-    $ErrorActionPreference = 'Stop'; $lockfileBackup = [System.IO.Path]::GetTempFileName(); Copy-Item Cargo.lock $lockfileBackup; try { cargo update; if ($LASTEXITCODE -ne 0) { throw "cargo update failed with exit code $LASTEXITCODE" }; cargo test --all-features --all-targets; if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" } } finally { Copy-Item $lockfileBackup Cargo.lock -Force; Remove-Item $lockfileBackup -Force }
+    $ErrorActionPreference = 'Stop'; $lockfileBackup = [System.IO.Path]::GetTempFileName(); Copy-Item Cargo.lock $lockfileBackup; try { cargo update; if ($LASTEXITCODE -ne 0) { throw "cargo update failed with exit code $LASTEXITCODE" }; just test; if ($LASTEXITCODE -ne 0) { throw "just test failed with exit code $LASTEXITCODE" } } finally { Copy-Item $lockfileBackup Cargo.lock -Force; Remove-Item $lockfileBackup -Force }
 
 # Run benchmarks.
 bench:
