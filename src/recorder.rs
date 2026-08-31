@@ -17,7 +17,8 @@ const CALIBRATION_DISTRIBUTIONS_PER_STAGE: usize = 3;
 pub(crate) const CALIBRATION_COLLECTING: u8 = 0;
 pub(crate) const CALIBRATION_FREEZING: u8 = 1;
 pub(crate) const CALIBRATION_FROZEN: u8 = 2;
-// F×(Tl,Ta) = 4 + P×(Tp,Tl,Ta) = 8 disjoint truth-table cells (§5).
+// First marks classify two tail predicates (4 cells); predecessor-bearing
+// marks classify three (8 cells). The 12 cells per stage are disjoint.
 pub(crate) const ONLINE_FIRST_COUNTERS: usize = 4;
 pub(crate) const ONLINE_COUNTERS_PER_STAGE: usize = 12;
 
@@ -57,8 +58,6 @@ impl CalibrationDistribution {
     }
 }
 
-// Some fixed snapshot-visible slots are connected by later hot-path stages.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DiagnosticCounter {
     InvalidStageMarks,
@@ -233,7 +232,6 @@ impl FixedStorageLayout {
     }
 }
 
-#[allow(dead_code)] // Storage fields are connected to checkpoints in Stage 3.
 pub(crate) struct Inner {
     pub(crate) cookie: RegistryCookie,
     pub(crate) stage_names: Box<[Box<str>]>,

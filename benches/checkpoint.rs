@@ -1,4 +1,4 @@
-//! Pre-registered API contract section-8 screening harness.
+//! Checkpoint overhead, contention, snapshot, and memory screening harness.
 //!
 //! Timings are medians of aggregate-repeat averages, never per-operation
 //! percentiles. Every measured checkpoint uses a fresh context and one
@@ -940,7 +940,7 @@ fn write_report(path: &PathBuf, report: &ScreeningReport) -> Result<(), String> 
 }
 
 fn print_summary(report: &ScreeningReport) {
-    println!("tracegrams section-8 core screening");
+    println!("tracegrams core screening");
     println!(
         "machine: {} {} ({})",
         report.environment.architecture,

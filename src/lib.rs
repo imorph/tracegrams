@@ -66,14 +66,11 @@
 //! calibration freeze and linear pipelines only; fan-out, retries, repeated
 //! stages, and recalibration are outside its contract.
 
-// These foundations are wired into the runtime in Stages 2 and 3.
-#[allow(dead_code)]
 mod bucket;
 mod calibration;
 mod context;
 mod diagnose;
 mod init;
-#[allow(dead_code)]
 mod matrix;
 mod recorder;
 mod snapshot;
