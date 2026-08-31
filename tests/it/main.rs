@@ -8,6 +8,8 @@
 mod calibration;
 mod clocked_recording;
 mod diagnosis;
+mod diagnosis_properties;
 mod init;
 mod manual_recording;
+mod properties;
 mod snapshot_delta;

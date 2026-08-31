@@ -514,11 +514,148 @@ fn relative_error(lower: u64, upper: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 
     const EXPECTED_DEFAULT_BOUNDS: [u64; BUCKETS - 1] =
         include!("../tests/fixtures/default_bounds.rs");
     const EXPECTED_CALIBRATION_BOUNDS: [u64; CALIBRATION_BUCKETS - 1] =
         include!("../tests/fixtures/calibration_bounds.rs");
+
+    #[allow(clippy::cast_precision_loss)]
+    fn quantile_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            8 => (1_u64..=1.0_f64.to_bits()).prop_map(f64::from_bits),
+            2 => (1_u64..=CALIBRATION_BUCKETS as u64).prop_flat_map(|divisor| {
+                let reciprocal = 1.0 / divisor as f64;
+                let bits = reciprocal.to_bits();
+                prop::sample::select(
+                    [bits - 1, bits, bits + 1]
+                        .into_iter()
+                        .map(f64::from_bits)
+                        .filter(|quantile| *quantile <= 1.0)
+                        .collect::<Vec<_>>(),
+                )
+            }),
+            1 => Just(1.0),
+            1 => prop::sample::select(vec![f64::from_bits(1), f64::MIN_POSITIVE]),
+        ]
+    }
+
+    fn counts_strategy() -> impl Strategy<Value = Vec<u64>> {
+        prop_oneof![
+            8 => prop::collection::vec(0_u64..=1_000_000, 1..=CALIBRATION_BUCKETS),
+            1 => (1_u64..=u64::MAX).prop_map(|samples| vec![samples]),
+            1 => (1_usize..=CALIBRATION_BUCKETS, 1_u64..=u64::MAX)
+                .prop_map(|(len, samples)| {
+                    let mut counts = vec![0; len];
+                    counts[0] = samples;
+                    counts
+                }),
+            1 => (1_usize..=CALIBRATION_BUCKETS, 1_u64..=u64::MAX)
+                .prop_map(|(len, samples)| {
+                    let mut counts = vec![0; len];
+                    counts[len - 1] = samples;
+                    counts
+                }),
+            1 => (1_u64..=u64::MAX / 2).prop_map(|count| vec![count, 0, count]),
+        ]
+    }
+
+    // Derive the exact binary rational without decoding the IEEE-754 fields,
+    // then apply `ceil(samples * numerator / 2^denominator_power)`.
+    fn rational_rank(samples: u64, quantile: f64) -> u128 {
+        let mut numerator = quantile;
+        let mut denominator_power = 0_u32;
+        while numerator.fract() != 0.0 {
+            numerator *= 2.0;
+            denominator_power += 1;
+        }
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let numerator = numerator as u64;
+        let product = u128::from(samples) * u128::from(numerator);
+        let rank = if denominator_power >= u128::BITS - product.leading_zeros() {
+            1
+        } else {
+            let quotient = product >> denominator_power;
+            let remainder_mask = (1_u128 << denominator_power) - 1;
+            quotient + u128::from(product & remainder_mask != 0)
+        };
+        rank.clamp(1, u128::from(samples))
+    }
+
+    fn assert_rank_case(counts: &[u64], quantile: f64) -> Result<RankSelection, TestCaseError> {
+        let samples = counts.iter().copied().sum::<u64>();
+        let selection = nearest_rank(counts, quantile).unwrap().unwrap();
+        let production_rank = quantile_rank(samples, quantile);
+
+        prop_assert!((1..=u128::from(samples)).contains(&selection.rank));
+        prop_assert_eq!(selection.rank, rational_rank(samples, quantile));
+        prop_assert_eq!(selection.rank, production_rank);
+
+        let before = counts[..selection.bucket]
+            .iter()
+            .map(|count| u128::from(*count))
+            .sum::<u128>();
+        let through = before + u128::from(counts[selection.bucket]);
+        prop_assert!(before < selection.rank);
+        prop_assert!(through >= selection.rank);
+        Ok(selection)
+    }
+
+    #[test]
+    fn nearest_rank_boundary_corpus() {
+        let predecessor_of_one = f64::from_bits(1.0_f64.to_bits() - 1);
+        let cases = [
+            (vec![1], 0.5),
+            (vec![u64::MAX, 0], 0.5),
+            (vec![0, u64::MAX], 0.5),
+            (vec![1, 2, 3], predecessor_of_one),
+            (vec![1, 2, 3], 1.0),
+            (vec![1, 1, 1, 1], 0.25),
+            (vec![1, 1, 1, 1], 0.5),
+            (vec![1, 1, 1, 1], 0.75),
+            (vec![1; 10], 0.3),
+            (vec![1, 2, 3], f64::from_bits(1)),
+            (vec![1, 2, 3], f64::MIN_POSITIVE),
+        ];
+
+        for (counts, quantile) in cases {
+            assert_rank_case(&counts, quantile).unwrap();
+        }
+    }
+
+    #[test]
+    fn nearest_rank_matches_exact_rational_oracle_and_is_monotonic() {
+        let config = Config {
+            cases: 256,
+            failure_persistence: Some(Box::new(
+                proptest::test_runner::FileFailurePersistence::Direct(
+                    "proptest-regressions/bucket.txt",
+                ),
+            )),
+            ..Config::default()
+        };
+        let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[0x5a; 32]);
+        let mut runner = TestRunner::new_with_rng(config, rng);
+        let strategy = (counts_strategy(), quantile_strategy(), quantile_strategy());
+
+        runner
+            .run(&strategy, |(counts, first_quantile, second_quantile)| {
+                let samples = counts.iter().copied().sum::<u64>();
+                prop_assume!(samples > 0);
+                let lower_quantile = first_quantile.min(second_quantile);
+                let upper_quantile = first_quantile.max(second_quantile);
+                let lower = assert_rank_case(&counts, lower_quantile)?;
+                let upper = assert_rank_case(&counts, upper_quantile)?;
+
+                prop_assert!(lower.rank <= upper.rank);
+                prop_assert!(lower.bucket <= upper.bucket);
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn default_table_is_byte_for_byte_compatible_with_the_poc() {
