@@ -1,10 +1,11 @@
 //! Checkpoint overhead, contention, snapshot, and memory screening harness.
 //!
 //! Timings are medians of aggregate-repeat averages, never per-operation
-//! percentiles. Instrumented cells use a fresh context and one finish-only
-//! mark; hot-bucket writers contend on the same counter cells, while the
-//! bucket-spread pattern scatters writes across buckets. Clocked cells
-//! include both the request-start and finish clock reads.
+//! percentiles. First-mark cells use a fresh context and one finish-only
+//! mark; transition cells record an intermediate stage and then finish at a
+//! second stage. Hot-bucket writers contend on the same counter cells, while
+//! the bucket-spread pattern scatters writes across buckets. Clocked cells
+//! include all request-start and checkpoint clock reads.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -31,6 +32,8 @@ const DEFAULT_CONTENDED_WRITERS: usize = 16;
 const HOT_DURATION_NS: u64 = 1_000;
 const MANUAL_BUDGET_NS: f64 = 50.0;
 const CLOCKED_BUDGET_NS: f64 = 120.0;
+const MANUAL_TRANSITION_BUDGET_NS: f64 = 100.0;
+const CLOCKED_TRANSITION_BUDGET_NS: f64 = 180.0;
 const HOT_CELL_BUDGET_CHECKPOINTS_PER_SECOND: f64 = 2_000_000.0;
 const SNAPSHOT_BUDGET_NS: f64 = 100_000_000.0;
 const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -168,6 +171,9 @@ enum Operation {
     ManualFrozenOnline,
     NoopClocked,
     ClockedCollecting,
+    ManualTransitionCollecting,
+    ManualTransitionFrozenOnline,
+    ClockedTransitionCollecting,
 }
 
 impl Operation {
@@ -178,18 +184,42 @@ impl Operation {
             Self::ManualFrozenOnline => "manual-frozen-online",
             Self::NoopClocked => "noop-clocked",
             Self::ClockedCollecting => "clocked-collecting",
+            Self::ManualTransitionCollecting => "manual-transition-collecting",
+            Self::ManualTransitionFrozenOnline => "manual-transition-frozen-online",
+            Self::ClockedTransitionCollecting => "clocked-transition-collecting",
         }
     }
 
     const fn instrumented(self) -> bool {
         matches!(
             self,
-            Self::ManualCollecting | Self::ManualFrozenOnline | Self::ClockedCollecting
+            Self::ManualCollecting
+                | Self::ManualFrozenOnline
+                | Self::ClockedCollecting
+                | Self::ManualTransitionCollecting
+                | Self::ManualTransitionFrozenOnline
+                | Self::ClockedTransitionCollecting
         )
     }
 
     const fn frozen(self) -> bool {
-        matches!(self, Self::ManualFrozenOnline)
+        matches!(
+            self,
+            Self::ManualFrozenOnline | Self::ManualTransitionFrozenOnline
+        )
+    }
+
+    const fn transition(self) -> bool {
+        matches!(
+            self,
+            Self::ManualTransitionCollecting
+                | Self::ManualTransitionFrozenOnline
+                | Self::ClockedTransitionCollecting
+        )
+    }
+
+    const fn checkpoints_per_request(self) -> u64 {
+        if self.transition() { 2 } else { 1 }
     }
 }
 
@@ -305,7 +335,8 @@ struct ScreeningReport {
 
 struct RecorderSetup {
     tracegrams: Tracegrams,
-    stage: StageId,
+    stage_a: StageId,
+    stage_b: Option<StageId>,
     spread_durations: Arc<[Duration]>,
 }
 
@@ -316,6 +347,8 @@ struct RunObservation {
     sample_delta: u128,
     completion_delta: u128,
     online_delta: u128,
+    cause_delta: u128,
+    incoming_delta: u128,
     nonzero_local_buckets: usize,
     reader_snapshot_ns: Vec<u128>,
 }
@@ -338,6 +371,9 @@ fn run(options: &Options) -> Result<ScreeningReport, String> {
         Operation::ManualFrozenOnline,
         Operation::NoopClocked,
         Operation::ClockedCollecting,
+        Operation::ManualTransitionCollecting,
+        Operation::ManualTransitionFrozenOnline,
+        Operation::ClockedTransitionCollecting,
     ];
     let mut cells = Vec::new();
     for operation in operations {
@@ -383,7 +419,7 @@ fn run(options: &Options) -> Result<ScreeningReport, String> {
             contended_writers: options.contended_writers,
             release_equivalent,
             preregistered_shape,
-            operation_shape: "fresh context plus one finish-only checkpoint; clocked cells include start() and finish() clock reads",
+            operation_shape: "first-mark cells divide elapsed time by one finish checkpoint/request; transition cells divide elapsed time by two checkpoints/request (stage_a mark/record_elapsed plus stage_b finish); clocked cells include all clock reads",
             timing_interpretation: "median and dispersion across aggregate-repeat averages; not per-operation percentiles",
         },
         cells,
@@ -412,7 +448,7 @@ fn measure_cell(
     for _ in 0..options.repeats {
         let setup = operation
             .instrumented()
-            .then(|| recorder_setup(operation.frozen()))
+            .then(|| recorder_setup(operation.frozen(), operation.transition()))
             .transpose()?;
         let warmup = run_concurrently(
             operation,
@@ -441,16 +477,20 @@ fn measure_cell(
             && (observed.sample_delta != total
                 || observed.completion_delta != total
                 || (operation.frozen() && observed.online_delta != total)
+                || (operation.transition()
+                    && (observed.cause_delta != total || observed.incoming_delta != total))
                 || observed.anomaly_counters != 0
                 || (matches!(pattern, Pattern::BucketSpread)
                     && observed.nonzero_local_buckets != expected_spread_buckets))
         {
             return Err(format!(
-                "{} checksum mismatch: samples={}, completions={}, online={}, anomalies={}, local_buckets={}, expected={total}",
+                "{} checksum mismatch: samples={}, completions={}, online={}, cause={}, incoming={}, anomalies={}, local_buckets={}, expected={total}",
                 operation.name(),
                 observed.sample_delta,
                 observed.completion_delta,
                 observed.online_delta,
+                observed.cause_delta,
+                observed.incoming_delta,
                 observed.anomaly_counters,
                 observed.nonzero_local_buckets,
             ));
@@ -472,7 +512,8 @@ fn measure_cell(
         }
 
         let elapsed_ns = observed.elapsed.as_nanos();
-        let total_f64 = total as f64;
+        let total_checkpoints = total * u128::from(operation.checkpoints_per_request());
+        let total_f64 = total_checkpoints as f64;
         let elapsed_ns_f64 = elapsed_ns as f64;
         elapsed_samples.push(elapsed_ns);
         ns_samples.push(elapsed_ns_f64 / total_f64);
@@ -489,7 +530,12 @@ fn measure_cell(
     };
     Ok(CellResult {
         name: format!(
-            "{}-{}-{}w{suffix}",
+            "{}-{}-{}-{}w{suffix}",
+            if operation.transition() {
+                "transition"
+            } else {
+                "first-mark"
+            },
             operation.name(),
             pattern.name(),
             writers
@@ -513,19 +559,34 @@ fn measure_cell(
     })
 }
 
-fn recorder_setup(frozen: bool) -> Result<RecorderSetup, String> {
+fn recorder_setup(frozen: bool, transition: bool) -> Result<RecorderSetup, String> {
     let mut builder = Tracegrams::builder();
-    let stage = builder
-        .stage("checkpoint")
+    let stage_a = builder
+        .stage("stage_a")
+        .map_err(|error| error.to_string())?;
+    let stage_b = transition
+        .then(|| builder.stage("stage_b"))
+        .transpose()
         .map_err(|error| error.to_string())?;
     let tracegrams = builder.build().map_err(|error| error.to_string())?;
     if frozen {
-        tracegrams.finish_manual(
-            tracegrams.start_manual(),
-            stage,
-            Duration::from_nanos(HOT_DURATION_NS),
-            Outcome::Success,
-        );
+        let mut context = tracegrams.start_manual();
+        if let Some(stage_b) = stage_b {
+            tracegrams.record_elapsed(&mut context, stage_a, Duration::from_nanos(HOT_DURATION_NS));
+            tracegrams.finish_manual(
+                context,
+                stage_b,
+                Duration::from_nanos(HOT_DURATION_NS),
+                Outcome::Success,
+            );
+        } else {
+            tracegrams.finish_manual(
+                context,
+                stage_a,
+                Duration::from_nanos(HOT_DURATION_NS),
+                Outcome::Success,
+            );
+        }
         tracegrams
             .try_freeze_calibration(FreezeCriteria::all_stages(1))
             .map_err(|error| error.to_string())?;
@@ -537,7 +598,8 @@ fn recorder_setup(frozen: bool) -> Result<RecorderSetup, String> {
         .into();
     Ok(RecorderSetup {
         tracegrams,
-        stage,
+        stage_a,
+        stage_b,
         spread_durations,
     })
 }
@@ -572,7 +634,8 @@ fn run_concurrently(
     for _ in 0..writers {
         let barrier = Arc::clone(&barrier);
         let tracegrams = setup.map(|setup| setup.tracegrams.clone());
-        let stage = setup.map(|setup| setup.stage);
+        let stage_a = setup.map(|setup| setup.stage_a);
+        let stage_b = setup.and_then(|setup| setup.stage_b);
         let spread_durations = setup.map(|setup| Arc::clone(&setup.spread_durations));
         workers.push(thread::spawn(move || {
             barrier.wait();
@@ -581,7 +644,8 @@ fn run_concurrently(
                 pattern,
                 checkpoints_per_writer,
                 tracegrams.as_ref(),
-                stage,
+                stage_a,
+                stage_b,
                 spread_durations.as_deref(),
             )
         }));
@@ -634,31 +698,44 @@ fn run_concurrently(
         .transpose()?
         .unwrap_or_default();
 
-    let (anomaly_counters, sample_delta, completion_delta, online_delta, nonzero_local_buckets) =
-        if let (Some(setup), Some(before)) = (setup, before.as_ref()) {
-            let after = setup.tracegrams.snapshot_relaxed();
-            let delta = after.delta(before).map_err(|error| error.to_string())?;
-            let samples = delta
-                .sample_counts(setup.stage)
-                .ok_or_else(|| "stage disappeared from snapshot".to_owned())?;
-            let completion = delta
-                .completion_counts(setup.stage)
-                .ok_or_else(|| "completion counts disappeared from snapshot".to_owned())?;
-            (
-                delta.diagnostics().total(),
-                samples.local(),
-                u128::from(completion.success()) + u128::from(completion.error()),
-                samples.online(),
-                delta
-                    .local_counts(setup.stage)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter(|count| **count > 0)
-                    .count(),
-            )
-        } else {
-            (0, 0, 0, 0, 0)
-        };
+    let (
+        anomaly_counters,
+        sample_delta,
+        completion_delta,
+        online_delta,
+        cause_delta,
+        incoming_delta,
+        nonzero_local_buckets,
+    ) = if let (Some(setup), Some(before)) = (setup, before.as_ref()) {
+        let after = setup.tracegrams.snapshot_relaxed();
+        let delta = after.delta(before).map_err(|error| error.to_string())?;
+        let destination = setup
+            .stage_b
+            .filter(|_| operation.transition())
+            .unwrap_or(setup.stage_a);
+        let samples = delta
+            .sample_counts(destination)
+            .ok_or_else(|| "stage disappeared from snapshot".to_owned())?;
+        let completion = delta
+            .completion_counts(destination)
+            .ok_or_else(|| "completion counts disappeared from snapshot".to_owned())?;
+        (
+            delta.diagnostics().total(),
+            samples.local(),
+            u128::from(completion.success()) + u128::from(completion.error()),
+            samples.online(),
+            samples.cause(),
+            samples.incoming(),
+            delta
+                .local_counts(destination)
+                .unwrap_or_default()
+                .iter()
+                .filter(|count| **count > 0)
+                .count(),
+        )
+    } else {
+        (0, 0, 0, 0, 0, 0, 0)
+    };
 
     Ok(RunObservation {
         elapsed,
@@ -667,6 +744,8 @@ fn run_concurrently(
         sample_delta,
         completion_delta,
         online_delta,
+        cause_delta,
+        incoming_delta,
         nonzero_local_buckets,
         reader_snapshot_ns,
     })
@@ -677,7 +756,8 @@ fn run_checkpoints(
     pattern: Pattern,
     checkpoints: u64,
     tracegrams: Option<&Tracegrams>,
-    stage: Option<StageId>,
+    stage_a: Option<StageId>,
+    stage_b: Option<StageId>,
     spread_durations: Option<&[Duration]>,
 ) -> u128 {
     let mut checksum = 0_u128;
@@ -695,7 +775,7 @@ fn run_checkpoints(
             }
             Operation::ManualCollecting | Operation::ManualFrozenOnline => {
                 let tracegrams = tracegrams.expect("manual cells have a recorder");
-                let stage = stage.expect("manual cells have a stage");
+                let stage = stage_a.expect("manual cells have a stage");
                 tracegrams.finish_manual(
                     black_box(tracegrams.start_manual()),
                     black_box(stage),
@@ -709,10 +789,38 @@ fn run_checkpoints(
             }
             Operation::ClockedCollecting => {
                 let tracegrams = tracegrams.expect("clocked cells have a recorder");
-                let stage = stage.expect("clocked cells have a stage");
+                let stage = stage_a.expect("clocked cells have a stage");
                 tracegrams.finish(
                     black_box(tracegrams.start()),
                     black_box(stage),
+                    Outcome::Success,
+                );
+            }
+            Operation::ManualTransitionCollecting | Operation::ManualTransitionFrozenOnline => {
+                let tracegrams = tracegrams.expect("manual transition cells have a recorder");
+                let mut context = black_box(tracegrams.start_manual());
+                tracegrams.record_elapsed(
+                    &mut context,
+                    black_box(stage_a.expect("transition cells have stage_a")),
+                    black_box(duration),
+                );
+                tracegrams.finish_manual(
+                    context,
+                    black_box(stage_b.expect("transition cells have stage_b")),
+                    black_box(duration),
+                    Outcome::Success,
+                );
+            }
+            Operation::ClockedTransitionCollecting => {
+                let tracegrams = tracegrams.expect("clocked transition cells have a recorder");
+                let mut context = black_box(tracegrams.start());
+                tracegrams.mark(
+                    &mut context,
+                    black_box(stage_a.expect("transition cells have stage_a")),
+                );
+                tracegrams.finish(
+                    context,
+                    black_box(stage_b.expect("transition cells have stage_b")),
                     Outcome::Success,
                 );
             }
@@ -830,6 +938,27 @@ fn evaluate_budgets(
         unit: "ns/checkpoint",
         passed: clocked.median_ns_per_checkpoint <= CLOCKED_BUDGET_NS,
     });
+    for (operation, budget) in [
+        ("manual-transition-collecting", MANUAL_TRANSITION_BUDGET_NS),
+        (
+            "manual-transition-frozen-online",
+            MANUAL_TRANSITION_BUDGET_NS,
+        ),
+        (
+            "clocked-transition-collecting",
+            CLOCKED_TRANSITION_BUDGET_NS,
+        ),
+    ] {
+        let cell = find_cell(cells, operation, "hot-bucket", 1, false);
+        budgets.push(BudgetResult {
+            metric: format!("{operation} uncontended median"),
+            comparison: "<=",
+            budget,
+            observed: cell.median_ns_per_checkpoint,
+            unit: "ns/checkpoint",
+            passed: cell.median_ns_per_checkpoint <= budget,
+        });
+    }
 
     for operation in [
         "manual-collecting",
