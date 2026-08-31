@@ -207,7 +207,6 @@ pub struct Diagnostics {
     clock_regressions: u64,
     latency_overflows: u64,
     cumulative_overflows: u64,
-    counter_overflows: u64,
     calibration_samples_skipped_while_freezing: u64,
     online_samples_skipped_missing_previous_threshold: u64,
 }
@@ -248,11 +247,6 @@ impl Diagnostics {
         self.cumulative_overflows
     }
 
-    /// Returns increments diverted after a data counter saturated.
-    pub const fn counter_overflows(self) -> u64 {
-        self.counter_overflows
-    }
-
     /// Returns calibration samples skipped while a freeze was in progress.
     pub const fn calibration_samples_skipped_while_freezing(self) -> u64 {
         self.calibration_samples_skipped_while_freezing
@@ -272,7 +266,6 @@ impl Diagnostics {
             + self.clock_regressions as u128
             + self.latency_overflows as u128
             + self.cumulative_overflows as u128
-            + self.counter_overflows as u128
             + self.calibration_samples_skipped_while_freezing as u128
             + self.online_samples_skipped_missing_previous_threshold as u128
     }
@@ -498,7 +491,6 @@ impl Snapshot {
             clock_regressions: count(DiagnosticCounter::ClockRegressions),
             latency_overflows: count(DiagnosticCounter::LatencyOverflows),
             cumulative_overflows: count(DiagnosticCounter::CumulativeOverflows),
-            counter_overflows: count(DiagnosticCounter::CounterOverflows),
             calibration_samples_skipped_while_freezing: count(
                 DiagnosticCounter::CalibrationSamplesSkippedWhileFreezing,
             ),
@@ -856,7 +848,6 @@ mod tests {
             DiagnosticCounter::ClockRegressions,
             DiagnosticCounter::LatencyOverflows,
             DiagnosticCounter::CumulativeOverflows,
-            DiagnosticCounter::CounterOverflows,
             DiagnosticCounter::CalibrationSamplesSkippedWhileFreezing,
             DiagnosticCounter::OnlineSamplesSkippedMissingPreviousThreshold,
         ];
@@ -873,12 +864,11 @@ mod tests {
         assert_eq!(observed.clock_regressions(), 5);
         assert_eq!(observed.latency_overflows(), 6);
         assert_eq!(observed.cumulative_overflows(), 7);
-        assert_eq!(observed.counter_overflows(), 8);
-        assert_eq!(observed.calibration_samples_skipped_while_freezing(), 9);
+        assert_eq!(observed.calibration_samples_skipped_while_freezing(), 8);
         assert_eq!(
             observed.online_samples_skipped_missing_previous_threshold(),
-            10
+            9
         );
-        assert_eq!(observed.total(), 55);
+        assert_eq!(observed.total(), 45);
     }
 }

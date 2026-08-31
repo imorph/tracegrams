@@ -97,5 +97,4 @@ pub use snapshot::{
 pub mod internal {
     //! Unstable benchmark seam, not public API: `benches/checkpoint.rs` must
     //! measure the exact crate-private hot-path primitive.
-    pub use crate::recorder::increment_counter;
 }

@@ -1228,33 +1228,6 @@ mod tests {
     }
 
     #[test]
-    fn saturated_hot_cell_increments_counter_overflow_diagnostic() {
-        let (tracegrams, first, _) = two_stage_recorder();
-        let bucket = bucketize(100, &tracegrams.inner.default_bounds);
-        let local = tracegrams
-            .inner
-            .layout
-            .local(first.index(), bucket)
-            .unwrap();
-        tracegrams.inner.counters[local].store(u64::MAX, Ordering::Relaxed);
-        let mut context = tracegrams.start_manual();
-
-        tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
-
-        assert_eq!(count(&tracegrams, local), u64::MAX);
-        assert_eq!(
-            count(
-                &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .diagnostic(DiagnosticCounter::CounterOverflows),
-            ),
-            1
-        );
-    }
-
-    #[test]
     fn rejected_finish_does_not_record_completion() {
         let (tracegrams, _, _) = two_stage_recorder();
         let (_, foreign, _) = two_stage_recorder();

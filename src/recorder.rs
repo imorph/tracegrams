@@ -39,7 +39,7 @@ pub(crate) fn predecessor_online_counter(
         + usize::from(cumulative_after_tail)
 }
 const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
-const DIAGNOSTIC_COUNTERS: usize = 10;
+const DIAGNOSTIC_COUNTERS: usize = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CalibrationDistribution {
@@ -69,7 +69,6 @@ pub(crate) enum DiagnosticCounter {
     ClockRegressions,
     LatencyOverflows,
     CumulativeOverflows,
-    CounterOverflows,
     CalibrationSamplesSkippedWhileFreezing,
     OnlineSamplesSkippedMissingPreviousThreshold,
 }
@@ -84,9 +83,8 @@ impl DiagnosticCounter {
             Self::ClockRegressions => 4,
             Self::LatencyOverflows => 5,
             Self::CumulativeOverflows => 6,
-            Self::CounterOverflows => 7,
-            Self::CalibrationSamplesSkippedWhileFreezing => 8,
-            Self::OnlineSamplesSkippedMissingPreviousThreshold => 9,
+            Self::CalibrationSamplesSkippedWhileFreezing => 7,
+            Self::OnlineSamplesSkippedMissingPreviousThreshold => 8,
         }
     }
 }
@@ -291,8 +289,7 @@ impl Inner {
     }
 
     pub(crate) fn increment(&self, index: usize) {
-        let overflow = self.layout.diagnostic(DiagnosticCounter::CounterOverflows);
-        increment_counter(&self.counters[index], &self.counters[overflow]);
+        increment_counter(&self.counters[index]);
     }
 
     pub(crate) fn increment_diagnostic(&self, diagnostic: DiagnosticCounter) {
@@ -300,25 +297,10 @@ impl Inner {
     }
 }
 
-/// Increments `counter`, diverting the increment into `overflows` once the
-/// counter saturates so no total is silently lost.
-pub fn increment_counter(counter: &AtomicU64, overflows: &AtomicU64) {
-    if !increment_saturating(counter) {
-        increment_saturating(overflows);
-    }
-}
-
-fn increment_saturating(counter: &AtomicU64) -> bool {
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = current.checked_add(1) else {
-            return false;
-        };
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
+/// Increments `counter`; wrap is out of scope because one increment per
+/// nanosecond takes approximately 584 years to exhaust `u64`.
+pub(crate) fn increment_counter(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -335,7 +317,7 @@ mod tests {
         assert_eq!(layout.completion_start, layout.online_start + 6 * 12);
         assert_eq!(layout.completion_counter_count(), 6 * 2);
         assert_eq!(layout.diagnostic_start, layout.completion_start + 6 * 2);
-        assert_eq!(layout.counter_count(), layout.diagnostic_start + 10);
+        assert_eq!(layout.counter_count(), layout.diagnostic_start + 9);
     }
 
     #[test]
@@ -346,34 +328,9 @@ mod tests {
         assert_eq!(layout.calibration_counter_count(), 48_000);
         assert_eq!(layout.online_counter_count(), 768);
         assert_eq!(layout.completion_counter_count(), 128);
-        assert_eq!(layout.counter_count(), 577_290);
+        assert_eq!(layout.counter_count(), 577_289);
         assert_eq!(FixedStorageLayout::new(0), None);
         assert_eq!(FixedStorageLayout::new(usize::MAX), None);
-    }
-
-    #[test]
-    fn counter_saturates_and_accounts_for_every_overflow() {
-        let counter = AtomicU64::new(u64::MAX - 1);
-        let overflows = AtomicU64::new(0);
-
-        increment_counter(&counter, &overflows);
-        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
-        assert_eq!(overflows.load(Ordering::Relaxed), 0);
-
-        increment_counter(&counter, &overflows);
-        increment_counter(&counter, &overflows);
-        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
-        assert_eq!(overflows.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn overflow_accounting_counter_cannot_wrap() {
-        let counter = AtomicU64::new(u64::MAX);
-        let overflows = AtomicU64::new(u64::MAX);
-
-        increment_counter(&counter, &overflows);
-        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
-        assert_eq!(overflows.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
