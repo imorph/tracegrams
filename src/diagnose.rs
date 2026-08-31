@@ -5,9 +5,7 @@ use std::fmt;
 
 use crate::bucket::{BUCKETS, RankSelection, nearest_rank};
 use crate::recorder::{ONLINE_COUNTERS_PER_STAGE, ONLINE_FIRST_COUNTERS};
-use crate::{
-    Consistency, DeltaSnapshot, OnlineDeltaAvailability, Snapshot, StageCalibrationReport, StageId,
-};
+use crate::{DeltaSnapshot, OnlineDeltaAvailability, Snapshot, StageCalibrationReport, StageId};
 
 /// The counter path from which a score was derived.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,8 +46,8 @@ pub enum ScoreStatus {
     ZeroDenominator,
     /// Relaxed inputs violated a probability invariant.
     ///
-    /// This is a defensive status and is currently unreachable through the
-    /// public API.
+    /// This defensive status preserves the observed rational terms while
+    /// withholding a ratio that would violate the probability invariant.
     InconsistentSnapshot,
     /// Threshold or ratio arithmetic exceeded its supported integer range.
     ArithmeticOverflow,
@@ -105,21 +103,16 @@ impl MatrixThresholds {
     }
 }
 
-/// One numeric matrix-derived score and its integer rational terms.
+/// One numeric diagnosis score and its integer rational terms.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MatrixScore {
+pub struct Score {
     numerator: u128,
     denominator: u128,
     value: Option<f64>,
     status: ScoreStatus,
 }
 
-impl MatrixScore {
-    /// Returns the matrix-derived score path.
-    pub const fn path(self) -> ScorePath {
-        ScorePath::MatrixDerived
-    }
-
+impl Score {
     /// Returns this score's availability status.
     pub const fn status(self) -> ScoreStatus {
         self.status
@@ -145,17 +138,16 @@ impl MatrixScore {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MatrixScores {
     stage: StageId,
-    consistency: Consistency,
     thresholds: MatrixThresholds,
     cause_samples: u128,
     incoming_samples: u128,
-    local_tail_origin_clean: MatrixScore,
-    local_tail_origin_tail: MatrixScore,
-    local_tail_rate_given_prev_tail: MatrixScore,
-    local_tail_rate_given_prev_not_tail: MatrixScore,
-    amplification_lift: MatrixScore,
-    carry_through: MatrixScore,
-    tail_onset: MatrixScore,
+    local_tail_origin_clean: Score,
+    local_tail_origin_tail: Score,
+    local_tail_rate_given_prev_tail: Score,
+    local_tail_rate_given_prev_not_tail: Score,
+    amplification_lift: Score,
+    carry_through: Score,
+    tail_onset: Score,
 }
 
 impl MatrixScores {
@@ -174,11 +166,6 @@ impl MatrixScores {
         ScorePopulation::PredecessorOnly
     }
 
-    /// Returns the relaxed consistency attached to the source snapshot.
-    pub const fn consistency(self) -> Consistency {
-        self.consistency
-    }
-
     /// Returns nearest-rank bucket thresholds for this destination.
     pub const fn thresholds(self) -> MatrixThresholds {
         self.thresholds
@@ -195,37 +182,37 @@ impl MatrixScores {
     }
 
     /// Returns `P(previous not tail | local tail)`.
-    pub const fn local_tail_origin_clean(self) -> MatrixScore {
+    pub const fn local_tail_origin_clean(self) -> Score {
         self.local_tail_origin_clean
     }
 
     /// Returns `P(previous tail | local tail)`.
-    pub const fn local_tail_origin_tail(self) -> MatrixScore {
+    pub const fn local_tail_origin_tail(self) -> Score {
         self.local_tail_origin_tail
     }
 
     /// Returns `P(local tail | previous tail)`.
-    pub const fn local_tail_rate_given_prev_tail(self) -> MatrixScore {
+    pub const fn local_tail_rate_given_prev_tail(self) -> Score {
         self.local_tail_rate_given_prev_tail
     }
 
     /// Returns `P(local tail | previous not tail)`.
-    pub const fn local_tail_rate_given_prev_not_tail(self) -> MatrixScore {
+    pub const fn local_tail_rate_given_prev_not_tail(self) -> Score {
         self.local_tail_rate_given_prev_not_tail
     }
 
     /// Returns the ratio between the previous-tail and previous-clean local-tail rates.
-    pub const fn amplification_lift(self) -> MatrixScore {
+    pub const fn amplification_lift(self) -> Score {
         self.amplification_lift
     }
 
     /// Returns `P(local not tail | previous tail)`.
-    pub const fn carry_through(self) -> MatrixScore {
+    pub const fn carry_through(self) -> Score {
         self.carry_through
     }
 
     /// Returns `P(previous not tail | cumulative after tail)`.
-    pub const fn tail_onset(self) -> MatrixScore {
+    pub const fn tail_onset(self) -> Score {
         self.tail_onset
     }
 
@@ -245,7 +232,6 @@ impl Snapshot {
     pub fn matrix_scores(&self, stage: StageId) -> Option<MatrixScores> {
         derive_matrix_scores(
             stage,
-            self.consistency(),
             self.tail_quantile(),
             self.cause_counts(stage)?,
             self.incoming_counts(stage),
@@ -258,7 +244,6 @@ impl DeltaSnapshot {
     pub fn matrix_scores(&self, stage: StageId) -> Option<MatrixScores> {
         derive_matrix_scores(
             stage,
-            self.consistency(),
             self.tail_quantile(),
             self.cause_counts(stage)?,
             self.incoming_counts(stage),
@@ -268,7 +253,6 @@ impl DeltaSnapshot {
 
 fn derive_matrix_scores(
     stage: StageId,
-    consistency: Consistency,
     tail_quantile: f64,
     cause: &[u64],
     incoming: Option<&[u64]>,
@@ -306,7 +290,7 @@ fn derive_matrix_scores(
 
     let cause_scores = cause_scores(cause, previous_cumulative, local);
     let tail_onset = incoming.map_or_else(
-        || MatrixScore::unavailable(ScoreStatus::NoPredecessorPopulation),
+        || Score::unavailable(ScoreStatus::NoPredecessorPopulation),
         |counts| {
             tail_onset_score(
                 counts,
@@ -319,7 +303,6 @@ fn derive_matrix_scores(
 
     Some(MatrixScores {
         stage,
-        consistency,
         thresholds,
         cause_samples,
         incoming_samples,
@@ -427,12 +410,12 @@ fn threshold(counts: &[u64], overflowed: bool, quantile: f64) -> Threshold {
 
 #[derive(Clone, Copy)]
 struct CauseScores {
-    local_tail_origin_clean: MatrixScore,
-    local_tail_origin_tail: MatrixScore,
-    local_tail_rate_given_prev_tail: MatrixScore,
-    local_tail_rate_given_prev_not_tail: MatrixScore,
-    amplification_lift: MatrixScore,
-    carry_through: MatrixScore,
+    local_tail_origin_clean: Score,
+    local_tail_origin_tail: Score,
+    local_tail_rate_given_prev_tail: Score,
+    local_tail_rate_given_prev_not_tail: Score,
+    amplification_lift: Score,
+    carry_through: Score,
 }
 
 fn cause_scores(
@@ -445,7 +428,7 @@ fn cause_scores(
         .and_then(|previous| local_threshold.bucket().map(|local| (previous, local)));
     let Ok((previous_threshold, local_threshold)) = unavailable else {
         let status = unavailable.unwrap_err();
-        let score = MatrixScore::unavailable(status);
+        let score = Score::unavailable(status);
         return CauseScores {
             local_tail_origin_clean: score,
             local_tail_origin_tail: score,
@@ -485,29 +468,26 @@ fn cause_scores(
 
     let local_tail_total = local_tail_from_prev_not_tail + local_tail_from_prev_tail;
     CauseScores {
-        local_tail_origin_clean: MatrixScore::probability(
+        local_tail_origin_clean: Score::probability(
             local_tail_from_prev_not_tail,
             local_tail_total,
         ),
-        local_tail_origin_tail: MatrixScore::probability(
-            local_tail_from_prev_tail,
-            local_tail_total,
-        ),
-        local_tail_rate_given_prev_tail: MatrixScore::probability(
+        local_tail_origin_tail: Score::probability(local_tail_from_prev_tail, local_tail_total),
+        local_tail_rate_given_prev_tail: Score::probability(
             local_tail_from_prev_tail,
             prev_tail_total,
         ),
-        local_tail_rate_given_prev_not_tail: MatrixScore::probability(
+        local_tail_rate_given_prev_not_tail: Score::probability(
             local_tail_from_prev_not_tail,
             prev_not_tail_total,
         ),
-        amplification_lift: MatrixScore::lift(
+        amplification_lift: Score::lift(
             local_tail_from_prev_tail,
             prev_tail_total,
             local_tail_from_prev_not_tail,
             prev_not_tail_total,
         ),
-        carry_through: MatrixScore::probability(carry_through, prev_tail_total),
+        carry_through: Score::probability(carry_through, prev_tail_total),
     }
 }
 
@@ -516,9 +496,9 @@ fn tail_onset_score(
     previous_threshold: Threshold,
     cumulative_after_threshold: Threshold,
     incoming_samples: u128,
-) -> MatrixScore {
+) -> Score {
     if incoming_samples == 0 {
-        return MatrixScore::unavailable(ScoreStatus::NoPredecessorPopulation);
+        return Score::unavailable(ScoreStatus::NoPredecessorPopulation);
     }
     let thresholds = previous_threshold.bucket().and_then(|previous| {
         cumulative_after_threshold
@@ -526,7 +506,7 @@ fn tail_onset_score(
             .map(|after| (previous, after))
     });
     let Ok((previous_threshold, cumulative_after_threshold)) = thresholds else {
-        return MatrixScore::unavailable(thresholds.unwrap_err());
+        return Score::unavailable(thresholds.unwrap_err());
     };
 
     let mut numerator = 0_u128;
@@ -542,10 +522,10 @@ fn tail_onset_score(
             }
         }
     }
-    MatrixScore::probability(numerator, denominator)
+    Score::probability(numerator, denominator)
 }
 
-impl MatrixScore {
+impl Score {
     const fn unavailable(status: ScoreStatus) -> Self {
         Self {
             numerator: 0,
@@ -586,17 +566,9 @@ impl MatrixScore {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ScoreParts {
-    numerator: u128,
-    denominator: u128,
-    value: Option<f64>,
-    status: ScoreStatus,
-}
-
-fn score_probability(numerator: u128, denominator: u128) -> ScoreParts {
+fn score_probability(numerator: u128, denominator: u128) -> Score {
     if denominator == 0 {
-        return ScoreParts {
+        return Score {
             numerator,
             denominator,
             value: None,
@@ -604,7 +576,7 @@ fn score_probability(numerator: u128, denominator: u128) -> ScoreParts {
         };
     }
     if numerator > denominator {
-        return ScoreParts {
+        return Score {
             numerator,
             denominator,
             value: None,
@@ -621,7 +593,7 @@ fn score_lift(
     previous_tail: u128,
     clean_local_tail: u128,
     previous_clean: u128,
-) -> ScoreParts {
+) -> Score {
     let Some(numerator) = tail_local_tail.checked_mul(previous_clean) else {
         return unavailable_parts(ScoreStatus::ArithmeticOverflow);
     };
@@ -629,7 +601,7 @@ fn score_lift(
         return unavailable_parts(ScoreStatus::ArithmeticOverflow);
     };
     if denominator == 0 {
-        return ScoreParts {
+        return Score {
             numerator,
             denominator,
             value: None,
@@ -639,8 +611,8 @@ fn score_lift(
     score_ratio(numerator, denominator)
 }
 
-const fn unavailable_parts(status: ScoreStatus) -> ScoreParts {
-    ScoreParts {
+const fn unavailable_parts(status: ScoreStatus) -> Score {
+    Score {
         numerator: 0,
         denominator: 0,
         value: None,
@@ -649,8 +621,8 @@ const fn unavailable_parts(status: ScoreStatus) -> ScoreParts {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn score_ratio(numerator: u128, denominator: u128) -> ScoreParts {
-    ScoreParts {
+fn score_ratio(numerator: u128, denominator: u128) -> Score {
+    Score {
         numerator,
         denominator,
         value: Some(numerator as f64 / denominator as f64),
@@ -683,90 +655,22 @@ impl CalibratedThresholds {
     }
 }
 
-/// One calibrated-online score and its integer rational terms.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CalibratedOnlineScore {
-    numerator: u128,
-    denominator: u128,
-    value: Option<f64>,
-    status: ScoreStatus,
-}
-
-impl CalibratedOnlineScore {
-    /// Returns the calibrated-online score path.
-    pub const fn path(self) -> ScorePath {
-        ScorePath::CalibratedOnline
-    }
-
-    /// Returns this score's availability status.
-    pub const fn status(self) -> ScoreStatus {
-        self.status
-    }
-
-    /// Returns the integer numerator of this score's ratio.
-    pub const fn numerator(self) -> u128 {
-        self.numerator
-    }
-
-    /// Returns the integer denominator of this score's ratio.
-    pub const fn denominator(self) -> u128 {
-        self.denominator
-    }
-
-    /// Returns the ratio when the score is available.
-    pub const fn value(self) -> Option<f64> {
-        self.value
-    }
-
-    const fn from_parts(parts: ScoreParts) -> Self {
-        Self {
-            numerator: parts.numerator,
-            denominator: parts.denominator,
-            value: parts.value,
-            status: parts.status,
-        }
-    }
-
-    fn probability(numerator: u128, denominator: u128) -> Self {
-        Self::from_parts(score_probability(numerator, denominator))
-    }
-
-    fn lift(
-        tail_local_tail: u128,
-        previous_tail: u128,
-        clean_local_tail: u128,
-        previous_clean: u128,
-    ) -> Self {
-        Self::from_parts(score_lift(
-            tail_local_tail,
-            previous_tail,
-            clean_local_tail,
-            previous_clean,
-        ))
-    }
-
-    const fn no_predecessor() -> Self {
-        Self::from_parts(unavailable_parts(ScoreStatus::NoPredecessorPopulation))
-    }
-}
-
 /// Exact frozen-threshold scores for one reached-stage population.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CalibratedOnlineScores {
     stage: StageId,
-    consistency: Consistency,
     epoch: u16,
     thresholds: CalibratedThresholds,
     samples: u128,
     first_samples: u128,
     predecessor_samples: u128,
-    local_tail_origin_clean: CalibratedOnlineScore,
-    local_tail_origin_tail: CalibratedOnlineScore,
-    local_tail_rate_given_prev_tail: CalibratedOnlineScore,
-    local_tail_rate_given_prev_not_tail: CalibratedOnlineScore,
-    amplification_lift: CalibratedOnlineScore,
-    carry_through: CalibratedOnlineScore,
-    tail_onset: CalibratedOnlineScore,
+    local_tail_origin_clean: Score,
+    local_tail_origin_tail: Score,
+    local_tail_rate_given_prev_tail: Score,
+    local_tail_rate_given_prev_not_tail: Score,
+    amplification_lift: Score,
+    carry_through: Score,
+    tail_onset: Score,
 }
 
 impl CalibratedOnlineScores {
@@ -783,11 +687,6 @@ impl CalibratedOnlineScores {
     /// Returns the all-reached population represented by the truth table.
     pub const fn population(self) -> ScorePopulation {
         ScorePopulation::AllReachedMarks
-    }
-
-    /// Returns the relaxed consistency attached to the source snapshot.
-    pub const fn consistency(self) -> Consistency {
-        self.consistency
     }
 
     /// Returns the frozen online epoch.
@@ -816,37 +715,37 @@ impl CalibratedOnlineScores {
     }
 
     /// Returns `P(clean | local tail)` over first and predecessor marks.
-    pub const fn local_tail_origin_clean(self) -> CalibratedOnlineScore {
+    pub const fn local_tail_origin_clean(self) -> Score {
         self.local_tail_origin_clean
     }
 
     /// Returns `P(previous tail | local tail)`; first marks count only in the denominator.
-    pub const fn local_tail_origin_tail(self) -> CalibratedOnlineScore {
+    pub const fn local_tail_origin_tail(self) -> Score {
         self.local_tail_origin_tail
     }
 
     /// Returns `P(local tail | previous tail)`.
-    pub const fn local_tail_rate_given_prev_tail(self) -> CalibratedOnlineScore {
+    pub const fn local_tail_rate_given_prev_tail(self) -> Score {
         self.local_tail_rate_given_prev_tail
     }
 
     /// Returns `P(local tail | previous not tail)`.
-    pub const fn local_tail_rate_given_prev_not_tail(self) -> CalibratedOnlineScore {
+    pub const fn local_tail_rate_given_prev_not_tail(self) -> Score {
         self.local_tail_rate_given_prev_not_tail
     }
 
     /// Returns the ratio between previous-tail and previous-clean local-tail rates.
-    pub const fn amplification_lift(self) -> CalibratedOnlineScore {
+    pub const fn amplification_lift(self) -> Score {
         self.amplification_lift
     }
 
     /// Returns `P(local not tail | previous tail)`.
-    pub const fn carry_through(self) -> CalibratedOnlineScore {
+    pub const fn carry_through(self) -> Score {
         self.carry_through
     }
 
     /// Returns `P(clean | cumulative after tail)` over first and predecessor marks.
-    pub const fn tail_onset(self) -> CalibratedOnlineScore {
+    pub const fn tail_onset(self) -> Score {
         self.tail_onset
     }
 
@@ -878,7 +777,6 @@ struct OnlineTotals {
 
 fn derive_calibrated_online_scores(
     stage: StageId,
-    consistency: Consistency,
     epoch: u16,
     calibration: &StageCalibrationReport,
     counts: &[u64],
@@ -896,7 +794,7 @@ fn derive_calibrated_online_scores(
     };
     let totals = online_totals(counts);
 
-    let no_predecessor = CalibratedOnlineScore::no_predecessor();
+    let no_predecessor = Score::unavailable(ScoreStatus::NoPredecessorPopulation);
     let (
         local_tail_origin_tail,
         local_tail_rate_given_prev_tail,
@@ -913,37 +811,30 @@ fn derive_calibrated_online_scores(
         )
     } else {
         (
-            CalibratedOnlineScore::probability(
-                totals.local_tail_previous_tail,
-                totals.local_tail_total,
-            ),
-            CalibratedOnlineScore::probability(
-                totals.local_tail_previous_tail,
-                totals.previous_tail_total,
-            ),
-            CalibratedOnlineScore::probability(
+            Score::probability(totals.local_tail_previous_tail, totals.local_tail_total),
+            Score::probability(totals.local_tail_previous_tail, totals.previous_tail_total),
+            Score::probability(
                 totals.local_tail_previous_clean,
                 totals.previous_clean_total,
             ),
-            CalibratedOnlineScore::lift(
+            Score::lift(
                 totals.local_tail_previous_tail,
                 totals.previous_tail_total,
                 totals.local_tail_previous_clean,
                 totals.previous_clean_total,
             ),
-            CalibratedOnlineScore::probability(totals.carry_through, totals.previous_tail_total),
+            Score::probability(totals.carry_through, totals.previous_tail_total),
         )
     };
 
     Some(CalibratedOnlineScores {
         stage,
-        consistency,
         epoch,
         thresholds,
         samples: totals.first_samples + totals.predecessor_samples,
         first_samples: totals.first_samples,
         predecessor_samples: totals.predecessor_samples,
-        local_tail_origin_clean: CalibratedOnlineScore::probability(
+        local_tail_origin_clean: Score::probability(
             totals.local_tail_clean,
             totals.local_tail_total,
         ),
@@ -952,10 +843,7 @@ fn derive_calibrated_online_scores(
         local_tail_rate_given_prev_not_tail,
         amplification_lift,
         carry_through,
-        tail_onset: CalibratedOnlineScore::probability(
-            totals.tail_onset,
-            totals.cumulative_after_tail_total,
-        ),
+        tail_onset: Score::probability(totals.tail_onset, totals.cumulative_after_tail_total),
     })
 }
 
@@ -1217,7 +1105,6 @@ fn derive_snapshot_online_scores(
         .ok_or(DiagnoseError::NotCalibrated { stage })?;
     derive_calibrated_online_scores(
         stage,
-        snapshot.consistency(),
         snapshot.calibration_epoch(),
         &calibration,
         snapshot
@@ -1237,7 +1124,6 @@ fn derive_delta_online_scores(
         .ok_or(DiagnoseError::NotCalibrated { stage })?;
     derive_calibrated_online_scores(
         stage,
-        snapshot.consistency(),
         snapshot.calibration_epoch(),
         &calibration,
         snapshot
@@ -1427,7 +1313,7 @@ fn display_optional_bucket(
 fn display_online_score(
     formatter: &mut fmt::Formatter<'_>,
     name: &str,
-    score: CalibratedOnlineScore,
+    score: Score,
 ) -> fmt::Result {
     display_score_parts(
         formatter,
@@ -1442,7 +1328,7 @@ fn display_online_score(
 fn display_matrix_score(
     formatter: &mut fmt::Formatter<'_>,
     name: &str,
-    score: MatrixScore,
+    score: Score,
 ) -> fmt::Result {
     display_score_parts(
         formatter,
@@ -1508,14 +1394,8 @@ mod tests {
         let counts: [u64; ONLINE_COUNTERS_PER_STAGE] =
             std::array::from_fn(|cell| u64::try_from(cell + 1).unwrap());
 
-        let scores = derive_calibrated_online_scores(
-            destination,
-            Consistency::Relaxed,
-            1,
-            &calibration,
-            &counts,
-        )
-        .unwrap();
+        let scores =
+            derive_calibrated_online_scores(destination, 1, &calibration, &counts).unwrap();
 
         assert_eq!(scores.samples(), 78);
         assert_eq!(scores.first_samples(), 10);
@@ -1573,7 +1453,7 @@ mod tests {
 
     #[test]
     fn algebraically_skewed_relaxed_counts_are_inconclusive() {
-        let score = MatrixScore::probability(2, 1);
+        let score = Score::probability(2, 1);
 
         assert_eq!(score.status(), ScoreStatus::InconsistentSnapshot);
         assert_eq!(score.numerator(), 2);
@@ -1590,14 +1470,7 @@ mod tests {
         cause[0] = u64::MAX;
         cause[1] = 1;
 
-        let scores = derive_matrix_scores(
-            destination,
-            Consistency::Relaxed,
-            0.99,
-            &cause,
-            Some(&cause),
-        )
-        .unwrap();
+        let scores = derive_matrix_scores(destination, 0.99, &cause, Some(&cause)).unwrap();
 
         assert_eq!(scores.cause_samples(), u128::from(u64::MAX) + 1);
         assert_eq!(

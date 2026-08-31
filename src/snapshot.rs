@@ -45,8 +45,6 @@ pub enum OnlineDeltaAvailability {
 pub enum DeltaError {
     /// The snapshots came from different recorder registries.
     RegistryMismatch,
-    /// The snapshots carry different bucket tables.
-    BucketTableMismatch,
     /// A supposedly later monotonic counter was smaller than its earlier value.
     CounterUnderflow {
         /// Value observed in the earlier snapshot.
@@ -61,9 +59,6 @@ impl fmt::Display for DeltaError {
         match self {
             Self::RegistryMismatch => {
                 formatter.write_str("snapshots belong to different registries")
-            }
-            Self::BucketTableMismatch => {
-                formatter.write_str("snapshots use different bucket tables")
             }
             Self::CounterUnderflow { earlier, later } => write!(
                 formatter,
@@ -203,7 +198,6 @@ pub struct Diagnostics {
     invalid_stage_marks: u64,
     invalid_context_marks: u64,
     non_monotonic_marks: u64,
-    marks_after_finish: u64,
     clock_regressions: u64,
     latency_overflows: u64,
     cumulative_overflows: u64,
@@ -225,11 +219,6 @@ impl Diagnostics {
     /// Returns repeated or decreasing stage marks.
     pub const fn non_monotonic_marks(self) -> u64 {
         self.non_monotonic_marks
-    }
-
-    /// Returns adapter-reported marks attempted after request completion.
-    pub const fn marks_after_finish(self) -> u64 {
-        self.marks_after_finish
     }
 
     /// Returns rejected clock readings earlier than the context timestamp.
@@ -262,7 +251,6 @@ impl Diagnostics {
         self.invalid_stage_marks as u128
             + self.invalid_context_marks as u128
             + self.non_monotonic_marks as u128
-            + self.marks_after_finish as u128
             + self.clock_regressions as u128
             + self.latency_overflows as u128
             + self.cumulative_overflows as u128
@@ -487,7 +475,6 @@ impl Snapshot {
             invalid_stage_marks: count(DiagnosticCounter::InvalidStageMarks),
             invalid_context_marks: count(DiagnosticCounter::InvalidContextMarks),
             non_monotonic_marks: count(DiagnosticCounter::NonMonotonicMarks),
-            marks_after_finish: count(DiagnosticCounter::MarksAfterFinish),
             clock_regressions: count(DiagnosticCounter::ClockRegressions),
             latency_overflows: count(DiagnosticCounter::LatencyOverflows),
             cumulative_overflows: count(DiagnosticCounter::CumulativeOverflows),
@@ -509,12 +496,6 @@ impl Snapshot {
         if self.cookie != earlier.cookie {
             return Err(DeltaError::RegistryMismatch);
         }
-        if self.bucket_bounds != earlier.bucket_bounds
-            || self.calibration_bucket_bounds != earlier.calibration_bucket_bounds
-        {
-            return Err(DeltaError::BucketTableMismatch);
-        }
-
         let same_epoch = self.calibration_epoch == earlier.calibration_epoch;
         let online_start = self.layout.online_start();
         let online_end = online_start + self.layout.online_counter_count();
@@ -837,26 +818,12 @@ mod tests {
     }
 
     #[test]
-    fn delta_rejects_a_different_bucket_table() {
-        let (tracegrams, _, _) = two_stage_recorder();
-        let earlier = tracegrams.snapshot_relaxed();
-        let mut later = earlier.clone();
-        later.bucket_bounds[0] += 1;
-
-        assert_eq!(
-            later.delta(&earlier).unwrap_err(),
-            DeltaError::BucketTableMismatch
-        );
-    }
-
-    #[test]
     fn every_diagnostic_counter_is_snapshot_visible() {
         let (tracegrams, _, _) = two_stage_recorder();
         let diagnostics = [
             DiagnosticCounter::InvalidStageMarks,
             DiagnosticCounter::InvalidContextMarks,
             DiagnosticCounter::NonMonotonicMarks,
-            DiagnosticCounter::MarksAfterFinish,
             DiagnosticCounter::ClockRegressions,
             DiagnosticCounter::LatencyOverflows,
             DiagnosticCounter::CumulativeOverflows,
@@ -872,15 +839,14 @@ mod tests {
         assert_eq!(observed.invalid_stage_marks(), 1);
         assert_eq!(observed.invalid_context_marks(), 2);
         assert_eq!(observed.non_monotonic_marks(), 3);
-        assert_eq!(observed.marks_after_finish(), 4);
-        assert_eq!(observed.clock_regressions(), 5);
-        assert_eq!(observed.latency_overflows(), 6);
-        assert_eq!(observed.cumulative_overflows(), 7);
-        assert_eq!(observed.calibration_samples_skipped_while_freezing(), 8);
+        assert_eq!(observed.clock_regressions(), 4);
+        assert_eq!(observed.latency_overflows(), 5);
+        assert_eq!(observed.cumulative_overflows(), 6);
+        assert_eq!(observed.calibration_samples_skipped_while_freezing(), 7);
         assert_eq!(
             observed.online_samples_skipped_missing_previous_threshold(),
-            9
+            8
         );
-        assert_eq!(observed.total(), 45);
+        assert_eq!(observed.total(), 36);
     }
 }

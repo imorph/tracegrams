@@ -10,14 +10,6 @@ use crate::recorder::{
     CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationDistribution,
 };
 
-/// Consistency guarantee attached to calibration scans and reports.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum CalibrationConsistency {
-    /// Cells were loaded atomically, but the scan has no single instant.
-    Relaxed,
-}
-
 /// Readiness of one calibration population.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -97,7 +89,6 @@ impl StageCalibrationReadiness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CalibrationReadiness {
     minimum_samples: u64,
-    consistency: CalibrationConsistency,
     stages: Box<[StageCalibrationReadiness]>,
 }
 
@@ -105,11 +96,6 @@ impl CalibrationReadiness {
     /// Returns the requested per-population minimum.
     pub const fn minimum_samples(&self) -> u64 {
         self.minimum_samples
-    }
-
-    /// Returns the scan consistency.
-    pub const fn consistency(&self) -> CalibrationConsistency {
-        self.consistency
     }
 
     /// Returns stage entries in registration order.
@@ -330,7 +316,6 @@ impl StageCalibrationReport {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FreezeReport {
     epoch: Option<u16>,
-    consistency: CalibrationConsistency,
     stages: Box<[StageCalibrationReport]>,
 }
 
@@ -338,11 +323,6 @@ impl FreezeReport {
     /// Returns the published epoch, or `None` for a failed range check.
     pub const fn epoch(&self) -> Option<u16> {
         self.epoch
-    }
-
-    /// Returns the explicitly relaxed freeze consistency.
-    pub const fn consistency(&self) -> CalibrationConsistency {
-        self.consistency
     }
 
     /// Returns selected stage reports in registration order.
@@ -573,7 +553,6 @@ impl Tracegrams {
         };
         let failed_report = FreezeReport {
             epoch: None,
-            consistency: CalibrationConsistency::Relaxed,
             stages: stage_reports.clone().into_boxed_slice(),
         };
         if let Some((stage, population, terminal)) = first_terminal(&stage_reports) {
@@ -607,7 +586,6 @@ impl Tracegrams {
             .store(CALIBRATION_FROZEN, Ordering::Release);
         Ok(FreezeReport {
             epoch: Some(epoch),
-            consistency: CalibrationConsistency::Relaxed,
             stages: stage_reports.into_boxed_slice(),
         })
     }
@@ -634,7 +612,6 @@ impl Tracegrams {
             .into_boxed_slice();
         Some(FreezeReport {
             epoch: Some(self.inner.calibration_epoch.load(Ordering::Relaxed)),
-            consistency: CalibrationConsistency::Relaxed,
             stages,
         })
     }
@@ -810,7 +787,6 @@ fn readiness_from_scans(scans: &[StageScan], minimum: u64) -> CalibrationReadine
         .into_boxed_slice();
     CalibrationReadiness {
         minimum_samples: minimum,
-        consistency: CalibrationConsistency::Relaxed,
         stages,
     }
 }

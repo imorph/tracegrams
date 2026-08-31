@@ -388,7 +388,6 @@ fn assert_snapshot(snapshot: &Snapshot, stages: &[StageId], model: &Model) {
     assert_eq!(actual.non_monotonic_marks(), expected.non_monotonic);
     assert_eq!(actual.latency_overflows(), expected.latency_overflow);
     assert_eq!(actual.cumulative_overflows(), expected.cumulative_overflow);
-    assert_eq!(actual.marks_after_finish(), 0);
     assert_eq!(actual.clock_regressions(), 0);
     assert_eq!(actual.calibration_samples_skipped_while_freezing(), 0);
     assert_eq!(

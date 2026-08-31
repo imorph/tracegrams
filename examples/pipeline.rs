@@ -8,6 +8,8 @@ use tracegrams::{Classification, DiagnoseConfig, FreezeCriteria, Outcome, StageI
 const CALIBRATION_REQUESTS: u64 = 100;
 
 fn record_manual_request(tracegrams: &Tracegrams, stages: [StageId; 3], elapsed: [Duration; 3]) {
+    // Factoring is optional: each start/record/finish call can instead remain
+    // explicit at its checkpoint call site.
     let mut context = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut context, stages[0], elapsed[0]);
     tracegrams.record_elapsed(&mut context, stages[1], elapsed[1]);

@@ -5,8 +5,8 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use tracegrams::{
-    CalibrationConsistency, CalibrationPopulation, CalibrationState, CalibrationTerminal,
-    CalibrationThresholdAvailability, FreezeCriteria, FreezeError, PopulationReadiness, Tracegrams,
+    CalibrationPopulation, CalibrationState, CalibrationTerminal, CalibrationThresholdAvailability,
+    FreezeCriteria, FreezeError, PopulationReadiness, Tracegrams,
 };
 
 #[test]
@@ -40,7 +40,6 @@ fn all_stage_freeze_publishes_one_complete_relaxed_bundle() {
         .try_freeze_calibration(FreezeCriteria::all_stages(3))
         .unwrap();
     assert_eq!(report.epoch(), Some(1));
-    assert_eq!(report.consistency(), CalibrationConsistency::Relaxed);
     assert_eq!(report.stages().len(), 2);
     let entry_report = report.stage(entry).unwrap();
     assert_eq!(

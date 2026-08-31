@@ -39,7 +39,7 @@ pub(crate) fn predecessor_online_counter(
         + usize::from(cumulative_after_tail)
 }
 const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
-const DIAGNOSTIC_COUNTERS: usize = 9;
+const DIAGNOSTIC_COUNTERS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CalibrationDistribution {
@@ -63,9 +63,6 @@ pub(crate) enum DiagnosticCounter {
     InvalidStageMarks,
     InvalidContextMarks,
     NonMonotonicMarks,
-    /// Reserved and currently never emitted: the owned-context API makes a
-    /// mark after `finish` unrepresentable. Re-evaluate this slot before 1.0.
-    MarksAfterFinish,
     ClockRegressions,
     LatencyOverflows,
     CumulativeOverflows,
@@ -79,12 +76,11 @@ impl DiagnosticCounter {
             Self::InvalidStageMarks => 0,
             Self::InvalidContextMarks => 1,
             Self::NonMonotonicMarks => 2,
-            Self::MarksAfterFinish => 3,
-            Self::ClockRegressions => 4,
-            Self::LatencyOverflows => 5,
-            Self::CumulativeOverflows => 6,
-            Self::CalibrationSamplesSkippedWhileFreezing => 7,
-            Self::OnlineSamplesSkippedMissingPreviousThreshold => 8,
+            Self::ClockRegressions => 3,
+            Self::LatencyOverflows => 4,
+            Self::CumulativeOverflows => 5,
+            Self::CalibrationSamplesSkippedWhileFreezing => 6,
+            Self::OnlineSamplesSkippedMissingPreviousThreshold => 7,
         }
     }
 }
@@ -370,7 +366,7 @@ mod tests {
         assert_eq!(layout.completion_start, layout.online_start + 6 * 12);
         assert_eq!(layout.completion_counter_count(), 6 * 2);
         assert_eq!(layout.diagnostic_start, layout.completion_start + 6 * 2);
-        assert_eq!(layout.counter_count(), layout.diagnostic_start + 9);
+        assert_eq!(layout.counter_count(), layout.diagnostic_start + 8);
     }
 
     #[test]
@@ -381,7 +377,7 @@ mod tests {
         assert_eq!(layout.calibration_counter_count(), 48_000);
         assert_eq!(layout.online_counter_count(), 768);
         assert_eq!(layout.completion_counter_count(), 128);
-        assert_eq!(layout.counter_count(), 577_289);
+        assert_eq!(layout.counter_count(), 577_288);
         assert_eq!(FixedStorageLayout::new(0), None);
         assert_eq!(FixedStorageLayout::new(usize::MAX), None);
     }

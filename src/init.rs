@@ -6,7 +6,7 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::bucket::{CALIBRATION_BUCKETS, calibration_bounds, default_bounds};
+use crate::bucket::{calibration_bounds, default_bounds};
 use crate::calibration::FrozenStageCalibration;
 use crate::recorder::{FixedStorageLayout, Inner};
 
@@ -62,13 +62,7 @@ impl fmt::Debug for StageId {
 pub struct MemoryEstimate {
     matrix: usize,
     calibration: usize,
-    calibration_thresholds: usize,
-    online: usize,
-    bounds: usize,
-    stage_metadata: usize,
-    completion: usize,
-    diagnostics: usize,
-    recorder_metadata: usize,
+    metadata: usize,
     total: usize,
 }
 
@@ -83,39 +77,9 @@ impl MemoryEstimate {
         self.calibration
     }
 
-    /// Bytes used by fixed calibration-threshold publication cells.
-    pub const fn calibration_threshold_bytes(self) -> usize {
-        self.calibration_thresholds
-    }
-
-    /// Bytes used by calibrated-online truth-table counters.
-    pub const fn online_bytes(self) -> usize {
-        self.online
-    }
-
-    /// Bytes used by the pinned ordinary and calibration bounds.
-    pub const fn bounds_bytes(self) -> usize {
-        self.bounds
-    }
-
-    /// Bytes used by stage-name metadata.
-    pub const fn stage_metadata_bytes(self) -> usize {
-        self.stage_metadata
-    }
-
-    /// Bytes used by success and error completion counters.
-    pub const fn completion_bytes(self) -> usize {
-        self.completion
-    }
-
-    /// Bytes used by hot-path diagnostic counters.
-    pub const fn diagnostics_bytes(self) -> usize {
-        self.diagnostics
-    }
-
-    /// Bytes used by fixed recorder and shared-handle metadata.
-    pub const fn recorder_metadata_bytes(self) -> usize {
-        self.recorder_metadata
+    /// Bytes used by bounds, publication cells, names, auxiliary counters, and recorder metadata.
+    pub const fn metadata_bytes(self) -> usize {
+        self.metadata
     }
 
     /// Total bytes included in the estimate.
@@ -404,16 +368,14 @@ fn estimate_memory(
         total.checked_add(bytes).ok_or(InitError::SizeOverflow)
     })?;
 
+    let metadata_bytes = total_bytes
+        .checked_sub(matrix_bytes)
+        .and_then(|bytes| bytes.checked_sub(calibration_bytes))
+        .ok_or(InitError::SizeOverflow)?;
     Ok(MemoryEstimate {
         matrix: matrix_bytes,
         calibration: calibration_bytes,
-        calibration_thresholds: calibration_threshold_bytes,
-        online: online_bytes,
-        bounds: bounds_bytes,
-        stage_metadata: stage_metadata_bytes,
-        completion: completion_bytes,
-        diagnostics: diagnostics_bytes,
-        recorder_metadata: recorder_metadata_bytes,
+        metadata: metadata_bytes,
         total: total_bytes,
     })
 }
@@ -421,8 +383,6 @@ fn estimate_memory(
 fn checked_bytes(items: usize, item_bytes: usize) -> Result<usize, InitError> {
     items.checked_mul(item_bytes).ok_or(InitError::SizeOverflow)
 }
-
-const _: () = assert!(CALIBRATION_BUCKETS == 250);
 
 #[cfg(test)]
 mod tests {

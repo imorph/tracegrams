@@ -3,13 +3,12 @@
 use std::time::Duration;
 
 use tracegrams::{
-    CalibratedOnlineScore, Classification, DiagnoseConfig, DiagnoseError, FreezeCriteria,
-    MatrixScore, Outcome, ScorePath, ScorePopulation, ScoreStatus, Tracegrams,
+    Classification, DiagnoseConfig, DiagnoseError, FreezeCriteria, Outcome, Score, ScorePath,
+    ScorePopulation, ScoreStatus, Tracegrams,
 };
 
 #[allow(clippy::cast_precision_loss)]
-fn assert_score(score: MatrixScore, numerator: u128, denominator: u128) {
-    assert_eq!(score.path(), ScorePath::MatrixDerived);
+fn assert_score(score: Score, numerator: u128, denominator: u128) {
     assert_eq!(score.status(), ScoreStatus::Available);
     assert_eq!(score.numerator(), numerator);
     assert_eq!(score.denominator(), denominator);
@@ -17,8 +16,7 @@ fn assert_score(score: MatrixScore, numerator: u128, denominator: u128) {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn assert_online_score(score: CalibratedOnlineScore, numerator: u128, denominator: u128) {
-    assert_eq!(score.path(), ScorePath::CalibratedOnline);
+fn assert_online_score(score: Score, numerator: u128, denominator: u128) {
     assert_eq!(score.status(), ScoreStatus::Available);
     assert_eq!(score.numerator(), numerator);
     assert_eq!(score.denominator(), denominator);

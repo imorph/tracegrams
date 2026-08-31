@@ -5,8 +5,8 @@ use std::time::Duration;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 use tracegrams::{
-    CalibratedOnlineScore, CalibrationEstimate, CalibrationTerminal, FreezeCriteria, MatrixScore,
-    Outcome, ScoreStatus, StageId, Tracegrams,
+    CalibrationEstimate, CalibrationTerminal, FreezeCriteria, Outcome, Score, ScoreStatus, StageId,
+    Tracegrams,
 };
 
 const QUANTILE: f64 = 0.5;
@@ -163,7 +163,7 @@ fn expected_scores(
     ]
 }
 
-fn assert_matrix(actual: &[MatrixScore; 7], expected: &[Expected; 7]) {
+fn assert_matrix(actual: &[Score; 7], expected: &[Expected; 7]) {
     for (actual, expected) in actual.iter().zip(expected) {
         assert_eq!(actual.numerator(), expected.numerator);
         assert_eq!(actual.denominator(), expected.denominator);
@@ -171,7 +171,7 @@ fn assert_matrix(actual: &[MatrixScore; 7], expected: &[Expected; 7]) {
     }
 }
 
-fn assert_online(actual: &[CalibratedOnlineScore; 7], expected: &[Expected; 7]) {
+fn assert_online(actual: &[Score; 7], expected: &[Expected; 7]) {
     for (actual, expected) in actual.iter().zip(expected) {
         assert_eq!(actual.numerator(), expected.numerator);
         assert_eq!(actual.denominator(), expected.denominator);
