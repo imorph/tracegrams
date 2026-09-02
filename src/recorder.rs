@@ -8,8 +8,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::bucket::{CALIBRATION_BUCKETS, calibration_bounds, default_bounds};
+use crate::bucket::{Bucket, CALIBRATION_BUCKETS, calibration_bounds, default_bounds};
 use crate::calibration::FrozenStageCalibration;
+use crate::context::{IncomingStageIndex, ValidatedStageIndex};
 use crate::init::{MemoryEstimate, RegistryCookie};
 use crate::matrix::StorageLayout;
 
@@ -22,9 +23,22 @@ pub(crate) const CALIBRATION_FROZEN: u8 = 2;
 pub(crate) const ONLINE_FIRST_COUNTERS: usize = 4;
 pub(crate) const ONLINE_COUNTERS_PER_STAGE: usize = 12;
 
+/// An online cell below [`ONLINE_COUNTERS_PER_STAGE`] by construction.
+///
+/// Only the two truth-table producers below create values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OnlineCounter(usize);
+
+impl OnlineCounter {
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+}
+
 #[inline]
-pub(crate) fn first_online_counter(local_tail: bool, cumulative_after_tail: bool) -> usize {
-    usize::from(local_tail) * 2 + usize::from(cumulative_after_tail)
+pub(crate) fn first_online_counter(local_tail: bool, cumulative_after_tail: bool) -> OnlineCounter {
+    OnlineCounter(usize::from(local_tail) * 2 + usize::from(cumulative_after_tail))
 }
 
 #[inline]
@@ -32,11 +46,13 @@ pub(crate) fn predecessor_online_counter(
     previous_tail: bool,
     local_tail: bool,
     cumulative_after_tail: bool,
-) -> usize {
-    ONLINE_FIRST_COUNTERS
-        + usize::from(previous_tail) * 4
-        + usize::from(local_tail) * 2
-        + usize::from(cumulative_after_tail)
+) -> OnlineCounter {
+    OnlineCounter(
+        ONLINE_FIRST_COUNTERS
+            + usize::from(previous_tail) * 4
+            + usize::from(local_tail) * 2
+            + usize::from(cumulative_after_tail),
+    )
 }
 const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
 const DIAGNOSTIC_COUNTERS: usize = 8;
@@ -163,7 +179,7 @@ impl FixedStorageLayout {
         self.matrix.local(stage, bucket)
     }
 
-    pub(crate) fn local_index(self, stage: usize, bucket: usize) -> usize {
+    pub(crate) fn local_index(self, stage: ValidatedStageIndex, bucket: Bucket) -> usize {
         self.matrix.local_index(stage, bucket)
     }
 
@@ -171,7 +187,7 @@ impl FixedStorageLayout {
         self.matrix.cumulative(stage, bucket)
     }
 
-    pub(crate) fn cumulative_index(self, stage: usize, bucket: usize) -> usize {
+    pub(crate) fn cumulative_index(self, stage: ValidatedStageIndex, bucket: Bucket) -> usize {
         self.matrix.cumulative_index(stage, bucket)
     }
 
@@ -186,9 +202,9 @@ impl FixedStorageLayout {
 
     pub(crate) fn cause_index(
         self,
-        destination: usize,
-        previous_cumulative: usize,
-        local: usize,
+        destination: ValidatedStageIndex,
+        previous_cumulative: Bucket,
+        local: Bucket,
     ) -> usize {
         self.matrix
             .cause_index(destination, previous_cumulative, local)
@@ -206,9 +222,9 @@ impl FixedStorageLayout {
 
     pub(crate) fn incoming_index(
         self,
-        destination: usize,
-        previous_cumulative: usize,
-        cumulative_after: usize,
+        destination: IncomingStageIndex,
+        previous_cumulative: Bucket,
+        cumulative_after: Bucket,
     ) -> usize {
         self.matrix
             .incoming_index(destination, previous_cumulative, cumulative_after)
@@ -235,10 +251,13 @@ impl FixedStorageLayout {
 
     pub(crate) fn calibration_index(
         self,
-        stage: usize,
+        stage: ValidatedStageIndex,
         distribution: CalibrationDistribution,
         bucket: usize,
     ) -> usize {
+        // The calibration bucket is raw; this release assertion was measured
+        // free and keeps an invalid bucket from reaching another segment.
+        let stage = stage.index();
         assert!(stage < self.stage_count && bucket < CALIBRATION_BUCKETS);
         self.calibration_start
             + (stage * CALIBRATION_DISTRIBUTIONS_PER_STAGE + distribution.offset())
@@ -255,9 +274,10 @@ impl FixedStorageLayout {
             .checked_add(counter)
     }
 
-    pub(crate) fn online_index(self, stage: usize, counter: usize) -> usize {
-        // Hot-path callers uphold the layout invariants in release builds;
-        // debug builds assert them here before calculating the flat offset.
+    pub(crate) fn online_index(self, stage: ValidatedStageIndex, counter: OnlineCounter) -> usize {
+        // Both dimensions are bounded by construction; the debug assertion is
+        // defense in depth.
+        let (stage, counter) = (stage.index(), counter.index());
         debug_assert!(stage < self.stage_count && counter < ONLINE_COUNTERS_PER_STAGE);
         self.online_start + stage * ONLINE_COUNTERS_PER_STAGE + counter
     }
@@ -271,7 +291,9 @@ impl FixedStorageLayout {
             .checked_add(usize::from(error))
     }
 
-    pub(crate) fn completion_index(self, stage: usize, error: bool) -> usize {
+    pub(crate) fn completion_index(self, stage: ValidatedStageIndex, error: bool) -> usize {
+        // Measured free in release; kept as defense in depth.
+        let stage = stage.index();
         assert!(stage < self.stage_count);
         self.completion_start + stage * COMPLETION_COUNTERS_PER_STAGE + usize::from(error)
     }
@@ -384,22 +406,36 @@ mod tests {
 
     #[test]
     fn online_truth_table_cells_are_disjoint_and_complete() {
+        // (local_tail, cumulative_after_tail) -> cell
+        let first = [
+            ((false, false), 0),
+            ((false, true), 1),
+            ((true, false), 2),
+            ((true, true), 3),
+        ];
+        // (previous_tail, local_tail, cumulative_after_tail) -> cell
+        let predecessor = [
+            ((false, false, false), 4),
+            ((false, false, true), 5),
+            ((false, true, false), 6),
+            ((false, true, true), 7),
+            ((true, false, false), 8),
+            ((true, false, true), 9),
+            ((true, true, false), 10),
+            ((true, true, true), 11),
+        ];
+
         let mut cells = Vec::new();
-        for local_tail in [false, true] {
-            for cumulative_after_tail in [false, true] {
-                cells.push(first_online_counter(local_tail, cumulative_after_tail));
-            }
+        for ((local_tail, cumulative_after_tail), expected) in first {
+            let cell = first_online_counter(local_tail, cumulative_after_tail).index();
+            assert_eq!(cell, expected);
+            cells.push(cell);
         }
-        for previous_tail in [false, true] {
-            for local_tail in [false, true] {
-                for cumulative_after_tail in [false, true] {
-                    cells.push(predecessor_online_counter(
-                        previous_tail,
-                        local_tail,
-                        cumulative_after_tail,
-                    ));
-                }
-            }
+        for ((previous_tail, local_tail, cumulative_after_tail), expected) in predecessor {
+            let cell = predecessor_online_counter(previous_tail, local_tail, cumulative_after_tail)
+                .index();
+            assert_eq!(cell, expected);
+            cells.push(cell);
         }
         cells.sort_unstable();
 

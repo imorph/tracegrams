@@ -1,9 +1,16 @@
 //! Checked indexing for the fixed shared counter storage.
+//!
+//! Two index planes share one arithmetic: the checked `Option` methods take
+//! raw `usize` dimensions for cold scans and models; the infallible `*_index`
+//! methods consume opaque bounded values produced at the recorder boundary,
+//! so an invalid logical dimension cannot reach them. Debug assertions and the
+//! final slice bounds check are defense in depth.
 
 use std::mem::size_of;
 use std::sync::atomic::AtomicU64;
 
-use crate::bucket::BUCKETS;
+use crate::bucket::{BUCKETS, Bucket};
+use crate::context::{IncomingStageIndex, ValidatedStageIndex};
 
 const MATRIX_CELLS: usize = BUCKETS * BUCKETS;
 
@@ -50,16 +57,16 @@ impl StorageLayout {
         self.distribution_index(0, stage, bucket)
     }
 
-    pub(crate) fn local_index(self, stage: usize, bucket: usize) -> usize {
-        self.distribution_index_unchecked(0, stage, bucket)
+    pub(crate) fn local_index(self, stage: ValidatedStageIndex, bucket: Bucket) -> usize {
+        self.distribution_index_unchecked(0, stage.index(), bucket.index())
     }
 
     pub(crate) fn cumulative(self, stage: usize, bucket: usize) -> Option<usize> {
         self.distribution_index(self.distribution_cells, stage, bucket)
     }
 
-    pub(crate) fn cumulative_index(self, stage: usize, bucket: usize) -> usize {
-        self.distribution_index_unchecked(self.distribution_cells, stage, bucket)
+    pub(crate) fn cumulative_index(self, stage: ValidatedStageIndex, bucket: Bucket) -> usize {
+        self.distribution_index_unchecked(self.distribution_cells, stage.index(), bucket.index())
     }
 
     pub(crate) fn cause(
@@ -73,11 +80,16 @@ impl StorageLayout {
 
     pub(crate) fn cause_index(
         self,
-        destination: usize,
-        previous_cumulative: usize,
-        local: usize,
+        destination: ValidatedStageIndex,
+        previous_cumulative: Bucket,
+        local: Bucket,
     ) -> usize {
-        self.matrix_index_unchecked(self.cause_start, destination, previous_cumulative, local)
+        self.matrix_index_unchecked(
+            self.cause_start,
+            destination.index(),
+            previous_cumulative.index(),
+            local.index(),
+        )
     }
 
     pub(crate) fn incoming(
@@ -102,18 +114,20 @@ impl StorageLayout {
 
     pub(crate) fn incoming_index(
         self,
-        destination: usize,
-        previous_cumulative: usize,
-        cumulative_after: usize,
+        destination: IncomingStageIndex,
+        previous_cumulative: Bucket,
+        cumulative_after: Bucket,
     ) -> usize {
-        // Hot-path callers uphold the layout invariants in release builds;
-        // debug builds assert them here before calculating the flat offset.
+        // An `IncomingStageIndex` exists only for a validated destination with
+        // a predecessor, so it is at least 1; the debug assertion is defense
+        // in depth.
+        let destination = destination.destination();
         debug_assert!(destination > 0 && destination < self.stage_count);
         self.matrix_index_unchecked(
             self.incoming_start,
             destination - 1,
-            previous_cumulative,
-            cumulative_after,
+            previous_cumulative.index(),
+            cumulative_after.index(),
         )
     }
 
@@ -127,8 +141,8 @@ impl StorageLayout {
     }
 
     fn distribution_index_unchecked(self, start: usize, stage: usize, bucket: usize) -> usize {
-        // Hot-path callers uphold the layout invariants in release builds;
-        // debug builds assert them here before calculating the flat offset.
+        // Reached only through the typed `*_index` methods above, whose
+        // arguments are bounded by construction.
         debug_assert!(stage < self.stage_count && bucket < BUCKETS);
         start + stage * BUCKETS + bucket
     }
@@ -150,8 +164,8 @@ impl StorageLayout {
         row: usize,
         column: usize,
     ) -> usize {
-        // Hot-path callers uphold the layout invariants in release builds;
-        // debug builds assert them here before calculating the flat offset.
+        // Reached only through the typed `*_index` methods above, whose
+        // arguments are bounded by construction.
         debug_assert!(matrix < self.stage_count && row < BUCKETS && column < BUCKETS);
         start + matrix * MATRIX_CELLS + row * BUCKETS + column
     }
@@ -227,45 +241,6 @@ mod tests {
         assert_eq!(max.counter_bytes(), Some(4_227_072));
         assert_eq!(StorageLayout::new(0), None);
         assert_eq!(StorageLayout::new(usize::MAX), None);
-    }
-
-    #[test]
-    fn infallible_indexes_agree_with_checked_indexes_on_every_valid_input() {
-        let stages = 3;
-        let layout = StorageLayout::new(stages).unwrap();
-
-        for stage in 0..stages {
-            for bucket in 0..BUCKETS {
-                assert_eq!(
-                    layout.local(stage, bucket).unwrap(),
-                    layout.local_index(stage, bucket)
-                );
-                assert_eq!(
-                    layout.cumulative(stage, bucket).unwrap(),
-                    layout.cumulative_index(stage, bucket)
-                );
-            }
-            for previous in 0..BUCKETS {
-                for local in 0..BUCKETS {
-                    assert_eq!(
-                        layout.cause(stage, previous, local).unwrap(),
-                        layout.cause_index(stage, previous, local)
-                    );
-                }
-            }
-        }
-        for destination in 1..stages {
-            for previous in 0..BUCKETS {
-                for cumulative_after in 0..BUCKETS {
-                    assert_eq!(
-                        layout
-                            .incoming(destination, previous, cumulative_after)
-                            .unwrap(),
-                        layout.incoming_index(destination, previous, cumulative_after)
-                    );
-                }
-            }
-        }
     }
 
     #[test]

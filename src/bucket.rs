@@ -3,6 +3,40 @@
 pub(crate) const BUCKETS: usize = 64;
 pub(crate) const CALIBRATION_BUCKETS: usize = 250;
 
+// `Bucket::from_six_bits` and the packed context metadata rely on an ordinary
+// bucket fitting exactly six bits.
+const _: () = assert!(BUCKETS == 1 << 6);
+
+/// An ordinary bucket index below [`BUCKETS`] by construction.
+///
+/// Only the bounded producers in this module create values; hot-path indexing
+/// consumes them without a runtime bounds check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Bucket(usize);
+
+impl Bucket {
+    /// Decodes the low six bits of `bits`; every input yields a valid bucket.
+    #[inline]
+    pub(crate) const fn from_six_bits(bits: u64) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let bucket = (bits & (BUCKETS as u64 - 1)) as usize;
+        Self(bucket)
+    }
+
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+
+    /// The bucket as the byte stored in a context; lossless below [`BUCKETS`].
+    #[inline]
+    pub(crate) const fn raw_u8(self) -> u8 {
+        #[allow(clippy::cast_possible_truncation)]
+        let raw = self.0 as u8;
+        raw
+    }
+}
+
 const DEFAULT_BOUNDS: [u64; BUCKETS - 1] = [
     100,
     135,
@@ -338,12 +372,16 @@ pub(crate) fn bucketize(value: u64, bounds: &[u64]) -> usize {
     bounds.partition_point(|&bound| value >= bound)
 }
 
-pub(crate) fn default_bucketize(value: u64) -> usize {
-    bucketize(value, &DEFAULT_BOUNDS)
+pub(crate) fn default_bucketize(value: u64) -> Bucket {
+    // `partition_point` over `BUCKETS - 1` bounds yields at most `BUCKETS - 1`.
+    let bucket = bucketize(value, &DEFAULT_BOUNDS);
+    debug_assert!(bucket < BUCKETS);
+    Bucket(bucket)
 }
 
 #[inline]
-pub(crate) fn calibration_bucketize(value: u64, default_bucket: usize) -> usize {
+pub(crate) fn calibration_bucketize(value: u64, default_bucket: Bucket) -> usize {
+    let default_bucket = default_bucket.index();
     if default_bucket == 0 {
         return 0;
     }
@@ -729,12 +767,40 @@ mod tests {
             .flat_map(|bound| [bound - 1, *bound, bound + 1])
             .chain([0, u64::MAX])
         {
-            let default_bucket = bucketize(value, default_bounds());
+            let default_bucket = default_bucketize(value);
+            assert_eq!(
+                default_bucket.index(),
+                bucketize(value, default_bounds()),
+                "value={value}"
+            );
             assert_eq!(
                 calibration_bucketize(value, default_bucket),
                 bucketize(value, calibration_bounds()),
                 "value={value}"
             );
+        }
+    }
+
+    #[test]
+    fn bucket_witnesses_stay_below_the_bucket_count_at_every_boundary() {
+        assert_eq!(default_bucketize(0).index(), 0);
+        assert_eq!(default_bucketize(u64::MAX).index(), BUCKETS - 1);
+        for (bucket, bound) in default_bounds().iter().enumerate() {
+            assert_eq!(default_bucketize(bound - 1).index(), bucket);
+            assert_eq!(default_bucketize(*bound).index(), bucket + 1);
+        }
+
+        assert_eq!(Bucket::from_six_bits(0).index(), 0);
+        assert_eq!(
+            Bucket::from_six_bits(BUCKETS as u64 - 1).index(),
+            BUCKETS - 1
+        );
+        assert_eq!(Bucket::from_six_bits(BUCKETS as u64).index(), 0);
+        assert_eq!(Bucket::from_six_bits(u64::MAX).index(), BUCKETS - 1);
+        for bucket in 0..BUCKETS {
+            let witness = Bucket::from_six_bits(bucket as u64);
+            assert_eq!(witness.index(), bucket);
+            assert_eq!(usize::from(witness.raw_u8()), bucket);
         }
     }
 

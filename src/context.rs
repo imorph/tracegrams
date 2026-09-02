@@ -1,10 +1,11 @@
 //! Per-request latency contexts and manual checkpoint recording.
 
 use std::fmt;
+use std::num::NonZeroU8;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::bucket::{calibration_bucketize, default_bucketize};
+use crate::bucket::{BUCKETS, Bucket, calibration_bucketize, default_bucketize};
 use crate::init::{RegistryCookie, StageId, Tracegrams};
 use crate::recorder::{
     CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationDistribution,
@@ -36,6 +37,53 @@ const PREVIOUS_BUCKET_SHIFT: u32 = 54;
 const PREVIOUS_FIELD_MASK: u64 = 0x3f;
 const HAS_PREVIOUS_BIT: u64 = 1 << 60;
 const IDENTITY_MASK: u64 = (1 << PREVIOUS_STAGE_SHIFT) - 1;
+
+// `Ctx` packs the previous bucket into a six-bit field that is turned back
+// into a `Bucket` by `Bucket::from_six_bits`, so both must agree on the width.
+const _: () = assert!(PREVIOUS_FIELD_MASK == BUCKETS as u64 - 1);
+
+/// A stage index of this recorder, proven below its stage count.
+///
+/// Produced only by [`Tracegrams::validate_mark`] after the stage cookie
+/// matched the recorder; valid for the current recording operation only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedStageIndex(u8);
+
+impl ValidatedStageIndex {
+    #[inline]
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A validated destination stage that has a predecessor, so it is at least 1
+/// and owns an incoming matrix.
+///
+/// Produced only by [`Tracegrams::validate_mark`] after the strict
+/// monotonicity check against the previous mark.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IncomingStageIndex(NonZeroU8);
+
+impl IncomingStageIndex {
+    #[inline]
+    pub(crate) const fn destination(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedPrevious {
+    cumulative_bucket: Bucket,
+    incoming: IncomingStageIndex,
+}
+
+/// A mark accepted at the recorder boundary; operation-local proof that every
+/// hot index dimension is in range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedMark {
+    stage: ValidatedStageIndex,
+    previous: Option<ValidatedPrevious>,
+}
 
 /// Clock-reading state for one linear request path.
 ///
@@ -296,10 +344,10 @@ impl Tracegrams {
         reading: ClockReading,
         outcome: Option<Outcome>,
     ) {
-        let previous = context.previous();
-        if !self.validate_mark(context.registry_cookie(), previous, stage) {
+        let Some(mark) = self.validate_mark(context.registry_cookie(), context.previous(), stage)
+        else {
             return;
-        }
+        };
         let Some(measured_ns) = reading.timestamp_ns.checked_sub(context.last_timestamp_ns) else {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::ClockRegressions);
@@ -312,9 +360,9 @@ impl Tracegrams {
         };
         let advance = self.record_valid_mark(
             context.cumulative_ns,
-            previous,
+            mark.stage,
+            mark.previous,
             context.calibration_epoch(),
-            stage,
             local_ns,
             latency_overflowed,
             outcome,
@@ -326,6 +374,8 @@ impl Tracegrams {
         context.set_previous(advance.previous);
     }
 
+    // Inlined into `finish_manual`, which consumes the context: the write-back
+    // of request-local state is then dead and dropped.
     #[inline]
     fn record_manual_mark(
         &self,
@@ -334,18 +384,20 @@ impl Tracegrams {
         elapsed: Duration,
         outcome: Option<Outcome>,
     ) {
-        if !self.validate_mark(u64::from(context.cookie.raw()), context.previous, stage) {
+        let Some(mark) =
+            self.validate_mark(u64::from(context.cookie.raw()), context.previous, stage)
+        else {
             return;
-        }
+        };
         let (local_ns, latency_overflowed) = match u64::try_from(elapsed.as_nanos()) {
             Ok(value) => (value, false),
             Err(_) => (u64::MAX, true),
         };
         let advance = self.record_valid_mark(
             context.cumulative_ns,
-            context.previous,
+            mark.stage,
+            mark.previous,
             context.calibration_epoch,
-            stage,
             local_ns,
             latency_overflowed,
             outcome,
@@ -356,28 +408,52 @@ impl Tracegrams {
         context.previous = Some(advance.previous);
     }
 
+    /// The single boundary where safe API misuse is rejected.
+    ///
+    /// A returned mark proves, for this operation only, that the stage belongs
+    /// to this recorder (so its index is below the stage count) and that any
+    /// predecessor precedes it strictly (so the destination is at least 1 and
+    /// owns an incoming matrix).
+    #[inline]
     fn validate_mark(
         &self,
         context_cookie: u64,
         previous: Option<PreviousMark>,
         stage: StageId,
-    ) -> bool {
+    ) -> Option<ValidatedMark> {
         if context_cookie != u64::from(self.inner.cookie.raw()) {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::InvalidContextMarks);
-            return false;
+            return None;
         }
         if stage.cookie() != self.inner.cookie {
             self.inner
                 .increment_diagnostic(DiagnosticCounter::InvalidStageMarks);
-            return false;
+            return None;
         }
-        if previous.is_some_and(|previous| stage.index() <= usize::from(previous.stage)) {
-            self.inner
-                .increment_diagnostic(DiagnosticCounter::NonMonotonicMarks);
-            return false;
-        }
-        true
+        let destination = stage.raw_index();
+        debug_assert!(usize::from(destination) < self.inner.layout.stage_count());
+        let previous = match previous {
+            None => None,
+            Some(previous) => {
+                // A destination strictly after any predecessor is never zero.
+                let Some(incoming) =
+                    NonZeroU8::new(destination).filter(|incoming| incoming.get() > previous.stage)
+                else {
+                    self.inner
+                        .increment_diagnostic(DiagnosticCounter::NonMonotonicMarks);
+                    return None;
+                };
+                Some(ValidatedPrevious {
+                    cumulative_bucket: Bucket::from_six_bits(u64::from(previous.cumulative_bucket)),
+                    incoming: IncomingStageIndex(incoming),
+                })
+            }
+        };
+        Some(ValidatedMark {
+            stage: ValidatedStageIndex(destination),
+            previous,
+        })
     }
 
     // Keep the ordered atomic update sequence together: context advancement
@@ -386,9 +462,9 @@ impl Tracegrams {
     fn record_valid_mark(
         &self,
         previous_cumulative_ns: u64,
-        previous: Option<PreviousMark>,
+        stage: ValidatedStageIndex,
+        previous: Option<ValidatedPrevious>,
         context_calibration_epoch: u16,
-        stage: StageId,
         local_ns: u64,
         latency_overflowed: bool,
         outcome: Option<Outcome>,
@@ -412,23 +488,19 @@ impl Tracegrams {
         };
 
         self.inner
-            .increment(self.inner.layout.local_index(stage.index(), local_bucket));
-        self.inner.increment(
-            self.inner
-                .layout
-                .cumulative_index(stage.index(), cumulative_bucket),
-        );
+            .increment(self.inner.layout.local_index(stage, local_bucket));
+        self.inner
+            .increment(self.inner.layout.cumulative_index(stage, cumulative_bucket));
 
         if let Some(previous) = previous {
-            let previous_bucket = usize::from(previous.cumulative_bucket);
             self.inner.increment(self.inner.layout.cause_index(
-                stage.index(),
-                previous_bucket,
+                stage,
+                previous.cumulative_bucket,
                 local_bucket,
             ));
             self.inner.increment(self.inner.layout.incoming_index(
-                stage.index(),
-                previous_bucket,
+                previous.incoming,
+                previous.cumulative_bucket,
                 cumulative_bucket,
             ));
         }
@@ -442,22 +514,20 @@ impl Tracegrams {
                     calibration_bucketize(cumulative_ns, cumulative_bucket)
                 };
                 self.inner.increment(self.inner.layout.calibration_index(
-                    stage.index(),
+                    stage,
                     CalibrationDistribution::Local,
                     calibration_local,
                 ));
                 self.inner.increment(self.inner.layout.calibration_index(
-                    stage.index(),
+                    stage,
                     CalibrationDistribution::CumulativeAfter,
                     calibration_after,
                 ));
                 if let Some(previous) = previous {
-                    let calibration_previous = calibration_bucketize(
-                        previous_cumulative_ns,
-                        usize::from(previous.cumulative_bucket),
-                    );
+                    let calibration_previous =
+                        calibration_bucketize(previous_cumulative_ns, previous.cumulative_bucket);
                     self.inner.increment(self.inner.layout.calibration_index(
-                        stage.index(),
+                        stage,
                         CalibrationDistribution::PreviousCumulative,
                         calibration_previous,
                     ));
@@ -469,8 +539,8 @@ impl Tracegrams {
             CALIBRATION_FROZEN => self.record_frozen_online(
                 context_calibration_epoch,
                 previous_cumulative_ns,
-                previous,
                 stage,
+                previous,
                 local_ns,
                 cumulative_ns,
             ),
@@ -483,17 +553,14 @@ impl Tracegrams {
                 Outcome::Error => true,
             };
             self.inner
-                .increment(self.inner.layout.completion_index(stage.index(), error));
+                .increment(self.inner.layout.completion_index(stage, error));
         }
 
         MarkAdvance {
             cumulative_ns,
             previous: PreviousMark {
-                // Registry construction bounds stage indices to 0..=63.
-                #[allow(clippy::cast_possible_truncation)]
-                stage: stage.index() as u8,
-                #[allow(clippy::cast_possible_truncation)]
-                cumulative_bucket: cumulative_bucket as u8,
+                stage: stage.0,
+                cumulative_bucket: cumulative_bucket.raw_u8(),
             },
         }
     }
@@ -502,8 +569,8 @@ impl Tracegrams {
         &self,
         context_calibration_epoch: u16,
         previous_cumulative_ns: u64,
-        previous: Option<PreviousMark>,
-        stage: StageId,
+        stage: ValidatedStageIndex,
+        previous: Option<ValidatedPrevious>,
         local_ns: u64,
         cumulative_after_ns: u64,
     ) {
@@ -533,7 +600,7 @@ impl Tracegrams {
         } else {
             first_online_counter(local_tail, cumulative_after_tail)
         };
-        let index = self.inner.layout.online_index(stage.index(), counter);
+        let index = self.inner.layout.online_index(stage, counter);
         self.inner.increment(index);
     }
 }
@@ -698,12 +765,15 @@ mod tests {
         install_test_clock(&tracegrams, &[(u64::MAX, false)]);
         let mut context = tracegrams.start();
 
+        let top_bucket = default_bucketize(u64::MAX).raw_u8();
+        assert_eq!(usize::from(top_bucket), BUCKETS - 1);
         context.set_previous(PreviousMark {
             stage: 63,
-            cumulative_bucket: 63,
+            cumulative_bucket: top_bucket,
         });
 
-        assert_eq!(size_of::<Ctx>(), 3 * size_of::<u64>());
+        assert_eq!(size_of::<Ctx>(), 24);
+        assert_eq!(size_of::<ManualCtx>(), 24);
         assert_eq!(
             context.registry_cookie(),
             u64::from(tracegrams.inner.cookie.raw())
@@ -713,7 +783,7 @@ mod tests {
             context.previous(),
             Some(PreviousMark {
                 stage: 63,
-                cumulative_bucket: 63,
+                cumulative_bucket: top_bucket,
             })
         );
         assert_eq!(context.last_timestamp_ns, u64::MAX);
@@ -1488,5 +1558,153 @@ mod tests {
                 .sum::<u64>(),
             4
         );
+    }
+
+    /// Exhaustive agreement between the typed hot indexes and the checked raw
+    /// plane. Witnesses come only from their real producers: `validate_mark`,
+    /// `default_bucketize`, and the online truth-table functions.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn typed_hot_indexes_agree_with_checked_indexes_on_every_valid_input() {
+        let stage_count = 3;
+        let mut builder = Tracegrams::builder();
+        let stages = (0..stage_count)
+            .map(|index| builder.stage(&format!("stage{index}")).unwrap())
+            .collect::<Vec<_>>();
+        let tracegrams = builder.build().unwrap();
+        let layout = tracegrams.inner.layout;
+        let cookie = u64::from(tracegrams.inner.cookie.raw());
+
+        let buckets = (0..BUCKETS)
+            .map(|bucket| {
+                let value = if bucket == 0 {
+                    0
+                } else {
+                    crate::bucket::default_bounds()[bucket - 1]
+                };
+                let witness = default_bucketize(value);
+                assert_eq!(witness.index(), bucket);
+                witness
+            })
+            .collect::<Vec<_>>();
+        let mut online = Vec::new();
+        for local_tail in [false, true] {
+            for cumulative_after_tail in [false, true] {
+                online.push(first_online_counter(local_tail, cumulative_after_tail));
+            }
+        }
+        for previous_tail in [false, true] {
+            for local_tail in [false, true] {
+                for cumulative_after_tail in [false, true] {
+                    online.push(predecessor_online_counter(
+                        previous_tail,
+                        local_tail,
+                        cumulative_after_tail,
+                    ));
+                }
+            }
+        }
+
+        let distributions = [
+            CalibrationDistribution::Local,
+            CalibrationDistribution::CumulativeAfter,
+            CalibrationDistribution::PreviousCumulative,
+        ];
+        for (destination, &stage_id) in stages.iter().enumerate() {
+            let first = tracegrams.validate_mark(cookie, None, stage_id).unwrap();
+            assert_eq!(first.stage.index(), destination);
+            assert!(first.previous.is_none());
+            let stage = first.stage;
+
+            for &bucket in &buckets {
+                assert_eq!(
+                    layout.local(destination, bucket.index()).unwrap(),
+                    layout.local_index(stage, bucket)
+                );
+                assert_eq!(
+                    layout.cumulative(destination, bucket.index()).unwrap(),
+                    layout.cumulative_index(stage, bucket)
+                );
+                for &column in &buckets {
+                    assert_eq!(
+                        layout
+                            .cause(destination, bucket.index(), column.index())
+                            .unwrap(),
+                        layout.cause_index(stage, bucket, column)
+                    );
+                }
+            }
+            for distribution in distributions {
+                for bucket in 0..CALIBRATION_BUCKETS {
+                    assert_eq!(
+                        layout
+                            .calibration(destination, distribution, bucket)
+                            .unwrap(),
+                        layout.calibration_index(stage, distribution, bucket)
+                    );
+                }
+            }
+            for &counter in &online {
+                assert_eq!(
+                    layout.online(destination, counter.index()).unwrap(),
+                    layout.online_index(stage, counter)
+                );
+            }
+            for error in [false, true] {
+                assert_eq!(
+                    layout.completion(destination, error).unwrap(),
+                    layout.completion_index(stage, error)
+                );
+            }
+
+            if destination == 0 {
+                continue;
+            }
+            // Every strictly earlier predecessor yields the same incoming witness.
+            for previous_stage in 0..destination {
+                let previous = PreviousMark {
+                    // Bounded by the three-stage recorder above.
+                    #[allow(clippy::cast_possible_truncation)]
+                    stage: previous_stage as u8,
+                    cumulative_bucket: buckets[0].raw_u8(),
+                };
+                let validated = tracegrams
+                    .validate_mark(cookie, Some(previous), stage_id)
+                    .unwrap();
+                let incoming = validated.previous.unwrap().incoming;
+                assert_eq!(incoming.destination(), destination);
+                for &row in &buckets {
+                    for &column in &buckets {
+                        assert_eq!(
+                            layout
+                                .incoming(destination, row.index(), column.index())
+                                .unwrap(),
+                            layout.incoming_index(incoming, row, column)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validation_never_yields_an_incoming_witness_for_the_first_stage() {
+        let (tracegrams, first, second) = two_stage_recorder();
+        let cookie = u64::from(tracegrams.inner.cookie.raw());
+        let previous = PreviousMark {
+            stage: 0,
+            cumulative_bucket: default_bucketize(0).raw_u8(),
+        };
+
+        assert!(
+            tracegrams
+                .validate_mark(cookie, Some(previous), first)
+                .is_none()
+        );
+        assert!(tracegrams.validate_mark(cookie + 1, None, first).is_none());
+        let accepted = tracegrams
+            .validate_mark(cookie, Some(previous), second)
+            .unwrap();
+        assert_eq!(accepted.previous.unwrap().incoming.destination(), 1);
     }
 }

@@ -45,6 +45,10 @@ impl StageId {
     pub(crate) const fn index(self) -> usize {
         self.index as usize
     }
+
+    pub(crate) const fn raw_index(self) -> u8 {
+        self.index
+    }
 }
 
 impl fmt::Debug for StageId {
