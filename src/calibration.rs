@@ -474,14 +474,7 @@ impl Tracegrams {
     /// population ready. An empty previous-cumulative population is reported
     /// as [`PopulationReadiness::AbsentNoPredecessor`].
     pub fn calibration_readiness(&self, minimum_samples: u64) -> CalibrationReadiness {
-        let stages = (0..self.inner.layout.stage_count())
-            .map(|index| {
-                // Registry construction bounds stage indices to 0..=63.
-                #[allow(clippy::cast_possible_truncation)]
-                let index = index as u8;
-                StageId::new(self.inner.cookie, index)
-            })
-            .collect::<Vec<_>>();
+        let stages = self.stage_ids().collect::<Vec<_>>();
         readiness_from_scans(&self.scan_calibration(&stages), minimum_samples)
     }
 
@@ -618,14 +611,7 @@ impl Tracegrams {
 
     fn validate_selection(&self, criteria: FreezeCriteria) -> Result<Vec<StageId>, FreezeError> {
         let mut stages = match criteria.selection {
-            FreezeSelection::All => (0..self.inner.layout.stage_count())
-                .map(|index| {
-                    // Registry construction bounds stage indices to 0..=63.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let index = index as u8;
-                    StageId::new(self.inner.cookie, index)
-                })
-                .collect(),
+            FreezeSelection::All => self.stage_ids().collect(),
             FreezeSelection::Selected(stages) => stages.into_vec(),
         };
         if stages.is_empty() {

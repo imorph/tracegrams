@@ -723,14 +723,10 @@ impl Tracegrams {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let stages = self
-            .inner
-            .stage_names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| StageMetadata {
-                // Registry construction bounds indices to 0..=63.
-                #[allow(clippy::cast_possible_truncation)]
-                id: StageId::new(self.inner.cookie, index as u8),
+            .stage_ids()
+            .zip(self.inner.stage_names.iter())
+            .map(|(id, name)| StageMetadata {
+                id,
                 name: name.clone(),
             })
             .collect::<Vec<_>>()

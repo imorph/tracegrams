@@ -38,10 +38,6 @@ impl RegistryCookie {
 }
 
 impl StageId {
-    pub(crate) const fn new(cookie: RegistryCookie, index: u8) -> Self {
-        Self { cookie, index }
-    }
-
     pub(crate) const fn cookie(self) -> RegistryCookie {
         self.cookie
     }
@@ -276,6 +272,19 @@ impl Tracegrams {
     /// ```
     pub fn builder() -> TracegramsBuilder {
         TracegramsBuilder::new()
+    }
+
+    /// Enumerates every registered stage in registration order.
+    ///
+    /// This is the only way to reconstruct a [`StageId`] after registration:
+    /// the range comes from the recorder layout, so an out-of-range index is
+    /// not requestable.
+    pub(crate) fn stage_ids(&self) -> impl Iterator<Item = StageId> + '_ {
+        let cookie = self.inner.cookie;
+        (0..self.inner.layout.stage_count()).map(move |index| StageId {
+            cookie,
+            index: u8::try_from(index).expect("registration bounds stage indices to 0..=63"),
+        })
     }
 }
 
