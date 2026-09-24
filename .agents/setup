@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+run_step() {
+    local description="$1"
+    shift
+
+    local started_at=$SECONDS
+    printf '\n==> %s\n' "$description"
+    "$@"
+    printf '<== %s (%ss)\n' "$description" "$((SECONDS - started_at))"
+}
+
+temporary_files=()
+cleanup() {
+    if ((${#temporary_files[@]})); then
+        rm -f -- "${temporary_files[@]}"
+    fi
+}
+trap cleanup EXIT
+
+system_packages=(build-essential ca-certificates curl)
+missing_packages=()
+for package in "${system_packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fqx 'install ok installed'; then
+        missing_packages+=("$package")
+    fi
+done
+
+if ((${#missing_packages[@]})); then
+    run_step "Update APT package metadata" sudo apt-get update
+    run_step "Install system packages" sudo apt-get install -y "${missing_packages[@]}"
+fi
+
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+
+if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
+    rustup_installer="$(mktemp)"
+    temporary_files+=("$rustup_installer")
+    run_step "Download rustup installer" \
+        curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+        https://sh.rustup.rs --output "$rustup_installer"
+    run_step "Install rustup" \
+        sh "$rustup_installer" -y --profile minimal --default-toolchain none
+fi
+
+# shellcheck disable=SC1091
+source "$CARGO_HOME/env"
+
+run_step "Install stable Rust" \
+    rustup toolchain install stable --profile minimal --component rustfmt,clippy
+run_step "Set the default Rust toolchain" rustup default stable
+run_step "Install nightly Rust" rustup toolchain install nightly --profile minimal
+run_step "Install Rust 1.85.0" rustup toolchain install 1.85.0 --profile minimal
+
+missing_cargo_tools=()
+command -v just >/dev/null || missing_cargo_tools+=(just)
+command -v cargo-docs-rs >/dev/null || missing_cargo_tools+=(cargo-docs-rs)
+command -v cargo-deny >/dev/null || missing_cargo_tools+=(cargo-deny)
+command -v zizmor >/dev/null || missing_cargo_tools+=(zizmor)
+
+if ((${#missing_cargo_tools[@]})); then
+    if ! command -v cargo-binstall >/dev/null; then
+        binstall_installer="$(mktemp)"
+        temporary_files+=("$binstall_installer")
+        run_step "Download cargo-binstall installer" \
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/cargo-bins/cargo-binstall/v1.23.0/install-from-binstall-release.sh \
+            --output "$binstall_installer"
+        run_step "Install cargo-binstall" env BINSTALL_VERSION=1.23.0 bash "$binstall_installer"
+    fi
+
+    run_step "Install Cargo tools" \
+        cargo binstall --no-confirm --locked "${missing_cargo_tools[@]}"
+fi
+
+run_step "Fetch locked Cargo dependencies" cargo fetch --locked
