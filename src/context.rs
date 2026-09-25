@@ -235,6 +235,7 @@ impl Tracegrams {
     }
 
     /// Starts a caller-timed request without reading the clock.
+    #[inline]
     pub fn start_manual(&self) -> ManualCtx {
         ManualCtx {
             cumulative_ns: 0,
@@ -245,11 +246,13 @@ impl Tracegrams {
     }
 
     /// Records one caller-supplied elapsed interval at `stage`.
+    #[inline]
     pub fn record_elapsed(&self, context: &mut ManualCtx, stage: StageId, elapsed: Duration) {
         self.record_manual_mark(context, stage, elapsed, None);
     }
 
     /// Records the final interval and completion outcome, consuming the context.
+    #[inline]
     pub fn finish_manual(
         &self,
         mut context: ManualCtx,
@@ -323,6 +326,7 @@ impl Tracegrams {
         context.set_previous(advance.previous);
     }
 
+    #[inline]
     fn record_manual_mark(
         &self,
         context: &mut ManualCtx,
