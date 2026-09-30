@@ -296,8 +296,11 @@ impl Snapshot {
     /// Purely subtracts `earlier` from this later snapshot and returns the
     /// window between them.
     ///
-    /// When exactly one endpoint observed the frozen state, the window spans
-    /// the calibration freeze; see [`Snapshot::spans_freeze`].
+    /// Both operands must be scans returned by [`Tracegrams::snapshot_relaxed`]
+    /// or clones of them, not earlier windows: a window's
+    /// [`Snapshot::spans_freeze`] flag does not carry through a second
+    /// subtraction. When exactly one endpoint observed the frozen state, the
+    /// window spans the calibration freeze.
     pub fn delta(&self, earlier: &Self) -> Result<Self, DeltaError> {
         if self.cookie != earlier.cookie {
             return Err(DeltaError::RegistryMismatch);

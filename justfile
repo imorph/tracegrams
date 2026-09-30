@@ -72,4 +72,5 @@ bench:
     cargo bench
 
 # Run all blocking checks.
+[unix]
 all: fmt-check clippy test package-check doc msrv-check deny actions-check

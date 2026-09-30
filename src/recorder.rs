@@ -371,6 +371,10 @@ impl Inner {
 
 /// Increments `counter`; wrap is out of scope because one increment per
 /// nanosecond takes approximately 584 years to exhaust `u64`.
+///
+/// Each mark increments exactly one cell of each population it enters, so the
+/// same bound applies to a population total: read-plane sums of one population
+/// fit `u64`, and products of two such sums fit `u128`.
 pub(crate) fn increment_counter(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
