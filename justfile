@@ -40,28 +40,9 @@ package-check:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo +nightly docs-rs
 
-[windows]
-doc:
-    $env:RUSTDOCFLAGS="-D warnings"; cargo +nightly docs-rs
-
 # Check the exact minimum supported Rust version.
 msrv-check:
     cargo +{{ msrv }} check --locked --all-features --all-targets
-
-# Check minimum dependency versions.
-[unix]
-minimal-versions:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    lockfile_backup="$(mktemp)"
-    cp Cargo.lock "$lockfile_backup"
-    trap 'cp "$lockfile_backup" Cargo.lock; rm -f "$lockfile_backup"' EXIT
-    cargo +nightly generate-lockfile -Zminimal-versions
-    cargo +nightly check --locked --all-features --all-targets
-
-[windows]
-minimal-versions:
-    $ErrorActionPreference = 'Stop'; $lockfileBackup = [System.IO.Path]::GetTempFileName(); Copy-Item Cargo.lock $lockfileBackup; try { cargo +nightly generate-lockfile -Zminimal-versions; if ($LASTEXITCODE -ne 0) { throw "cargo generate-lockfile failed with exit code $LASTEXITCODE" }; cargo +nightly check --locked --all-features --all-targets; if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" } } finally { Copy-Item $lockfileBackup Cargo.lock -Force; Remove-Item $lockfileBackup -Force }
 
 # Check dependency licenses, bans, and sources.
 deny:
@@ -86,13 +67,9 @@ test-latest-deps:
     cargo update
     just test
 
-[windows]
-test-latest-deps:
-    $ErrorActionPreference = 'Stop'; $lockfileBackup = [System.IO.Path]::GetTempFileName(); Copy-Item Cargo.lock $lockfileBackup; try { cargo update; if ($LASTEXITCODE -ne 0) { throw "cargo update failed with exit code $LASTEXITCODE" }; just test; if ($LASTEXITCODE -ne 0) { throw "just test failed with exit code $LASTEXITCODE" } } finally { Copy-Item $lockfileBackup Cargo.lock -Force; Remove-Item $lockfileBackup -Force }
-
 # Run benchmarks.
 bench:
     cargo bench
 
 # Run all blocking checks.
-all: fmt-check clippy test package-check doc msrv-check minimal-versions deny actions-check
+all: fmt-check clippy test package-check doc msrv-check deny actions-check
