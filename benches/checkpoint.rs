@@ -403,7 +403,7 @@ fn run(options: &Options) -> Result<ScreeningReport, String> {
     let budgets = evaluate_budgets(&cells, &snapshots, &memory, options.contended_writers);
 
     Ok(ScreeningReport {
-        schema_version: 2,
+        schema_version: 3,
         environment: environment(),
         protocol: Protocol {
             requests_per_writer: options.checkpoints_per_writer,
@@ -913,28 +913,19 @@ fn evaluate_budgets(
     memory: &MemoryResult,
     contended_writers: usize,
 ) -> Vec<BudgetResult> {
-    let mut budgets = Vec::new();
-    for operation in ["manual-collecting", "manual-frozen-online"] {
-        let cell = find_cell(cells, operation, "hot-bucket", 1, false);
-        budgets.push(BudgetResult {
-            metric: format!("{operation} uncontended median"),
-            comparison: "<=",
-            budget: MANUAL_BUDGET_NS,
-            observed: cell.median_ns_per_checkpoint,
-            unit: "ns/checkpoint",
-            passed: cell.median_ns_per_checkpoint <= MANUAL_BUDGET_NS,
-        });
-    }
-    let clocked = find_cell(cells, "clocked-collecting", "hot-bucket", 1, false);
-    budgets.push(BudgetResult {
-        metric: "clocked-collecting uncontended median".to_owned(),
+    let at_most = |metric: String, budget: f64, observed: f64, unit| BudgetResult {
+        metric,
         comparison: "<=",
-        budget: CLOCKED_BUDGET_NS,
-        observed: clocked.median_ns_per_checkpoint,
-        unit: "ns/checkpoint",
-        passed: clocked.median_ns_per_checkpoint <= CLOCKED_BUDGET_NS,
-    });
+        budget,
+        observed,
+        unit,
+        passed: observed <= budget,
+    };
+    let mut budgets = Vec::new();
     for (operation, budget) in [
+        ("manual-collecting", MANUAL_BUDGET_NS),
+        ("manual-frozen-online", MANUAL_BUDGET_NS),
+        ("clocked-collecting", CLOCKED_BUDGET_NS),
         ("manual-transition-collecting", MANUAL_TRANSITION_BUDGET_NS),
         (
             "manual-transition-frozen-online",
@@ -946,50 +937,43 @@ fn evaluate_budgets(
         ),
     ] {
         let cell = find_cell(cells, operation, "hot-bucket", 1, false);
-        budgets.push(BudgetResult {
-            metric: format!("{operation} uncontended median"),
-            comparison: "<=",
+        budgets.push(at_most(
+            format!("{operation} uncontended median"),
             budget,
-            observed: cell.median_ns_per_checkpoint,
-            unit: "ns/checkpoint",
-            passed: cell.median_ns_per_checkpoint <= budget,
-        });
+            cell.median_ns_per_checkpoint,
+            "ns/checkpoint",
+        ));
     }
-
     for operation in [
         "manual-collecting",
         "manual-frozen-online",
         "clocked-collecting",
     ] {
         let cell = find_cell(cells, operation, "hot-bucket", contended_writers, false);
+        let observed = cell.median_aggregate_checkpoints_per_second;
         budgets.push(BudgetResult {
             metric: format!("{operation} {contended_writers}-writer hot-cell throughput"),
             comparison: ">=",
             budget: HOT_CELL_BUDGET_CHECKPOINTS_PER_SECOND,
-            observed: cell.median_aggregate_checkpoints_per_second,
+            observed,
             unit: "checkpoints/s",
-            passed: cell.median_aggregate_checkpoints_per_second
-                >= HOT_CELL_BUDGET_CHECKPOINTS_PER_SECOND,
+            passed: observed >= HOT_CELL_BUDGET_CHECKPOINTS_PER_SECOND,
         });
     }
     for snapshot in snapshots {
-        budgets.push(BudgetResult {
-            metric: format!("{}-stage snapshot median", snapshot.stages),
-            comparison: "<=",
-            budget: SNAPSHOT_BUDGET_NS,
-            observed: snapshot.median_ns,
-            unit: "ns/snapshot",
-            passed: snapshot.median_ns <= SNAPSHOT_BUDGET_NS,
-        });
+        budgets.push(at_most(
+            format!("{}-stage snapshot median", snapshot.stages),
+            SNAPSHOT_BUDGET_NS,
+            snapshot.median_ns,
+            "ns/snapshot",
+        ));
     }
-    budgets.push(BudgetResult {
-        metric: "32-stage estimated memory".to_owned(),
-        comparison: "<=",
-        budget: MEMORY_BUDGET_BYTES as f64,
-        observed: memory.exact_estimated_bytes as f64,
-        unit: "bytes",
-        passed: memory.exact_estimated_bytes <= MEMORY_BUDGET_BYTES,
-    });
+    budgets.push(at_most(
+        "32-stage estimated memory".to_owned(),
+        MEMORY_BUDGET_BYTES as f64,
+        memory.exact_estimated_bytes as f64,
+        "bytes",
+    ));
     budgets
 }
 
