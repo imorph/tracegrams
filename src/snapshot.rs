@@ -4,14 +4,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::Ordering;
 
-use crate::bucket::{BUCKETS, calibration_bounds, default_bounds};
+use crate::bucket::{calibration_bounds, default_bounds};
 use crate::calibration::FreezeReport;
 use crate::init::{MemoryEstimate, RegistryCookie, StageId, Tracegrams};
-use crate::recorder::{
-    CalibrationPopulation, DiagnosticCounter, FixedStorageLayout, ONLINE_COUNTERS_PER_STAGE,
-};
-
-const MATRIX_CELLS: usize = BUCKETS * BUCKETS;
+use crate::recorder::{CalibrationPopulation, DiagnosticCounter, Segment, StorageLayout};
 
 /// A typed failure to subtract two snapshots.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,7 +157,7 @@ pub struct CompletionCounts {
 pub struct Snapshot {
     cookie: RegistryCookie,
     stages: Box<[StageMetadata]>,
-    layout: FixedStorageLayout,
+    layout: StorageLayout,
     counters: Box<[u64]>,
     tail_quantile: f64,
     calibration_state: CalibrationState,
@@ -217,19 +213,19 @@ impl Snapshot {
 
     /// Returns the local-latency distribution for `stage`.
     pub fn local_counts(&self, stage: StageId) -> Option<&[u64]> {
-        self.distribution(stage, |layout, stage| layout.local(stage, 0))
+        self.counts(stage, Segment::Local)
     }
 
     /// Returns the cumulative-latency-after distribution for `stage`.
     pub fn cumulative_counts(&self, stage: StageId) -> Option<&[u64]> {
-        self.distribution(stage, |layout, stage| layout.cumulative(stage, 0))
+        self.counts(stage, Segment::Cumulative)
     }
 
     /// Returns the destination-indexed cause matrix in row-major order.
     ///
     /// Rows are previous-cumulative buckets and columns are local buckets.
     pub fn cause_counts(&self, destination: StageId) -> Option<&[u64]> {
-        self.matrix(destination, |layout, stage| layout.cause(stage, 0, 0))
+        self.counts(destination, Segment::Cause)
     }
 
     /// Returns the destination-indexed incoming matrix in row-major order.
@@ -237,7 +233,7 @@ impl Snapshot {
     /// Rows are previous-cumulative buckets and columns are cumulative-after
     /// buckets. The first registered stage has no incoming matrix.
     pub fn incoming_counts(&self, destination: StageId) -> Option<&[u64]> {
-        self.matrix(destination, |layout, stage| layout.incoming(stage, 0, 0))
+        self.counts(destination, Segment::Incoming)
     }
 
     /// Returns a calibration distribution for `stage`.
@@ -246,16 +242,11 @@ impl Snapshot {
         stage: StageId,
         population: CalibrationPopulation,
     ) -> Option<&[u64]> {
-        let stage = self.stage_index(stage)?;
-        let start = self.layout.calibration(stage, population, 0)?;
-        self.counters
-            .get(start..start + calibration_bounds().len() + 1)
+        self.counts(stage, Segment::Calibration(population))
     }
 
     pub(crate) fn online_counts(&self, stage: StageId) -> Option<&[u64]> {
-        let stage = self.stage_index(stage)?;
-        let start = self.layout.online(stage, 0)?;
-        self.counters.get(start..start + ONLINE_COUNTERS_PER_STAGE)
+        self.counts(stage, Segment::Online)
     }
 
     /// Returns totals for every stored sample population at `stage`.
@@ -277,13 +268,10 @@ impl Snapshot {
 
     /// Returns terminal completion counts for `stage`.
     pub fn completion_counts(&self, stage: StageId) -> Option<CompletionCounts> {
-        let stage = self.stage_index(stage)?;
-        let success = self.layout.completion(stage, false)?;
-        let error = self.layout.completion(stage, true)?;
-        Some(CompletionCounts {
-            success: self.counters[success],
-            error: self.counters[error],
-        })
+        let &[success, error] = self.counts(stage, Segment::Completion)? else {
+            unreachable!("a completion segment holds two counters");
+        };
+        Some(CompletionCounts { success, error })
     }
 
     /// Returns all snapshot-visible anomaly and rejection counters.
@@ -346,24 +334,9 @@ impl Snapshot {
         (stage.cookie() == self.cookie && stage.index() < self.stages.len()).then(|| stage.index())
     }
 
-    fn distribution(
-        &self,
-        stage: StageId,
-        start: impl FnOnce(FixedStorageLayout, usize) -> Option<usize>,
-    ) -> Option<&[u64]> {
-        let stage = self.stage_index(stage)?;
-        let start = start(self.layout, stage)?;
-        self.counters.get(start..start + BUCKETS)
-    }
-
-    fn matrix(
-        &self,
-        stage: StageId,
-        start: impl FnOnce(FixedStorageLayout, usize) -> Option<usize>,
-    ) -> Option<&[u64]> {
-        let stage = self.stage_index(stage)?;
-        let start = start(self.layout, stage)?;
-        self.counters.get(start..start + MATRIX_CELLS)
+    fn counts(&self, stage: StageId, segment: Segment) -> Option<&[u64]> {
+        let range = self.layout.segment(self.stage_index(stage)?, segment)?;
+        Some(&self.counters[range])
     }
 }
 

@@ -2,19 +2,20 @@
 
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::ops::Range;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::bucket::{Bucket, CALIBRATION_BUCKETS};
+use crate::bucket::{BUCKETS, Bucket, CALIBRATION_BUCKETS};
 use crate::calibration::FrozenStageCalibration;
 use crate::context::{IncomingStageIndex, ValidatedStageIndex};
 use crate::init::{MemoryEstimate, RegistryCookie};
-use crate::matrix::StorageLayout;
 
-const CALIBRATION_DISTRIBUTIONS_PER_STAGE: usize = 3;
+const MATRIX_CELLS: usize = BUCKETS * BUCKETS;
+const CALIBRATION_POPULATIONS_PER_STAGE: usize = 3;
 pub(crate) const CALIBRATION_COLLECTING: u8 = 0;
 pub(crate) const CALIBRATION_FREEZING: u8 = 1;
 pub(crate) const CALIBRATION_FROZEN: u8 = 2;
@@ -22,40 +23,28 @@ pub(crate) const CALIBRATION_FROZEN: u8 = 2;
 // marks classify three (8 cells). The 12 cells per stage are disjoint.
 pub(crate) const ONLINE_FIRST_COUNTERS: usize = 4;
 pub(crate) const ONLINE_COUNTERS_PER_STAGE: usize = 12;
+const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
+const DIAGNOSTIC_COUNTERS: usize = 8;
 
-/// An online cell below [`ONLINE_COUNTERS_PER_STAGE`] by construction.
-///
-/// Only the two truth-table producers below create values.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct OnlineCounter(usize);
-
-impl OnlineCounter {
-    #[inline]
-    pub(crate) const fn index(self) -> usize {
-        self.0
-    }
-}
-
+/// Returns the online cell below [`ONLINE_FIRST_COUNTERS`] for a first mark.
 #[inline]
-pub(crate) fn first_online_counter(local_tail: bool, cumulative_after_tail: bool) -> OnlineCounter {
-    OnlineCounter(usize::from(local_tail) * 2 + usize::from(cumulative_after_tail))
+pub(crate) fn first_online_counter(local_tail: bool, cumulative_after_tail: bool) -> usize {
+    usize::from(local_tail) * 2 + usize::from(cumulative_after_tail)
 }
 
+/// Returns the online cell at or above [`ONLINE_FIRST_COUNTERS`] for a
+/// predecessor-bearing mark.
 #[inline]
 pub(crate) fn predecessor_online_counter(
     previous_tail: bool,
     local_tail: bool,
     cumulative_after_tail: bool,
-) -> OnlineCounter {
-    OnlineCounter(
-        ONLINE_FIRST_COUNTERS
-            + usize::from(previous_tail) * 4
-            + usize::from(local_tail) * 2
-            + usize::from(cumulative_after_tail),
-    )
+) -> usize {
+    ONLINE_FIRST_COUNTERS
+        + usize::from(previous_tail) * 4
+        + usize::from(local_tail) * 2
+        + usize::from(cumulative_after_tail)
 }
-const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
-const DIAGNOSTIC_COUNTERS: usize = 8;
 
 /// A calibration distribution stored for each stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,43 +95,71 @@ impl DiagnosticCounter {
     }
 }
 
+/// One per-stage run of counters in the fixed storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FixedStorageLayout {
+pub(crate) enum Segment {
+    Local,
+    Cumulative,
+    /// Row-major previous-cumulative by local buckets.
+    Cause,
+    /// Row-major previous-cumulative by cumulative-after buckets; the first
+    /// registered stage has no predecessor and therefore no incoming matrix.
+    Incoming,
+    Calibration(CalibrationPopulation),
+    Online,
+    /// Success, then error.
+    Completion,
+}
+
+/// Offsets of every counter segment in one flat array.
+///
+/// Cold readers take a checked [`StorageLayout::segment`] range. The hot
+/// `*_index` methods consume bounded values produced at the recorder boundary
+/// and share the same geometry; debug assertions and the final slice bounds
+/// check are defense in depth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StorageLayout {
     stage_count: usize,
-    matrix: StorageLayout,
+    cumulative_start: usize,
+    cause_start: usize,
+    incoming_start: usize,
     calibration_start: usize,
-    calibration_count: usize,
     online_start: usize,
-    online_count: usize,
     completion_start: usize,
-    completion_count: usize,
     diagnostic_start: usize,
     counter_count: usize,
 }
 
-impl FixedStorageLayout {
+impl StorageLayout {
     pub(crate) fn new(stage_count: usize) -> Option<Self> {
-        let matrix = StorageLayout::new(stage_count)?;
-        let calibration_count = stage_count
-            .checked_mul(CALIBRATION_DISTRIBUTIONS_PER_STAGE)?
-            .checked_mul(CALIBRATION_BUCKETS)?;
-        let calibration_start = matrix.counter_count();
-        let online_count = stage_count.checked_mul(ONLINE_COUNTERS_PER_STAGE)?;
-        let online_start = calibration_start.checked_add(calibration_count)?;
-        let completion_count = stage_count.checked_mul(COMPLETION_COUNTERS_PER_STAGE)?;
-        let completion_start = online_start.checked_add(online_count)?;
-        let diagnostic_start = completion_start.checked_add(completion_count)?;
+        if stage_count == 0 {
+            return None;
+        }
+        let distribution_cells = stage_count.checked_mul(BUCKETS)?;
+        let cumulative_start = distribution_cells;
+        let cause_start = cumulative_start.checked_add(distribution_cells)?;
+        let incoming_start = cause_start.checked_add(stage_count.checked_mul(MATRIX_CELLS)?)?;
+        let calibration_start =
+            incoming_start.checked_add((stage_count - 1).checked_mul(MATRIX_CELLS)?)?;
+        let online_start = calibration_start.checked_add(
+            stage_count
+                .checked_mul(CALIBRATION_POPULATIONS_PER_STAGE)?
+                .checked_mul(CALIBRATION_BUCKETS)?,
+        )?;
+        let completion_start =
+            online_start.checked_add(stage_count.checked_mul(ONLINE_COUNTERS_PER_STAGE)?)?;
+        let diagnostic_start = completion_start
+            .checked_add(stage_count.checked_mul(COMPLETION_COUNTERS_PER_STAGE)?)?;
         let counter_count = diagnostic_start.checked_add(DIAGNOSTIC_COUNTERS)?;
 
         Some(Self {
             stage_count,
-            matrix,
+            cumulative_start,
+            cause_start,
+            incoming_start,
             calibration_start,
-            calibration_count,
             online_start,
-            online_count,
             completion_start,
-            completion_count,
             diagnostic_start,
             counter_count,
         })
@@ -152,155 +169,147 @@ impl FixedStorageLayout {
         self.stage_count
     }
 
-    pub(crate) fn matrix_counter_bytes(self) -> Option<usize> {
-        self.matrix.counter_bytes()
-    }
-
-    pub(crate) const fn calibration_counter_count(self) -> usize {
-        self.calibration_count
-    }
-
-    pub(crate) const fn online_counter_count(self) -> usize {
-        self.online_count
-    }
-
-    pub(crate) const fn completion_counter_count(self) -> usize {
-        self.completion_count
-    }
-
-    pub(crate) const fn diagnostic_counter_count() -> usize {
-        DIAGNOSTIC_COUNTERS
-    }
-
     pub(crate) const fn counter_count(self) -> usize {
         self.counter_count
     }
 
-    pub(crate) fn local(self, stage: usize, bucket: usize) -> Option<usize> {
-        self.matrix.local(stage, bucket)
+    /// Counters in ordinary distributions and transition matrices.
+    pub(crate) const fn matrix_counter_count(self) -> usize {
+        self.calibration_start
     }
 
+    /// Counters in calibration distributions.
+    pub(crate) const fn calibration_counter_count(self) -> usize {
+        self.online_start - self.calibration_start
+    }
+
+    /// Returns the counters of `segment` for `stage`, or `None` for an
+    /// out-of-range stage and for the first stage's incoming matrix.
+    pub(crate) fn segment(self, stage: usize, segment: Segment) -> Option<Range<usize>> {
+        if stage >= self.stage_count || (stage == 0 && segment == Segment::Incoming) {
+            return None;
+        }
+        let (start, _, length) = self.geometry(segment, stage);
+        Some(start..start + length)
+    }
+
+    /// Returns `(start, stage_stride, length)` of `segment` at `stage`.
+    ///
+    /// Incoming matrices are stored for stages `1..stage_count` only, so their
+    /// stride starts one matrix earlier; callers exclude stage 0.
+    #[inline]
+    const fn geometry(self, segment: Segment, stage: usize) -> (usize, usize, usize) {
+        let (base, stride, length) = match segment {
+            Segment::Local => (0, BUCKETS, BUCKETS),
+            Segment::Cumulative => (self.cumulative_start, BUCKETS, BUCKETS),
+            Segment::Cause => (self.cause_start, MATRIX_CELLS, MATRIX_CELLS),
+            Segment::Incoming => (
+                self.incoming_start - MATRIX_CELLS,
+                MATRIX_CELLS,
+                MATRIX_CELLS,
+            ),
+            Segment::Calibration(population) => (
+                self.calibration_start + population.offset() * CALIBRATION_BUCKETS,
+                CALIBRATION_POPULATIONS_PER_STAGE * CALIBRATION_BUCKETS,
+                CALIBRATION_BUCKETS,
+            ),
+            Segment::Online => (
+                self.online_start,
+                ONLINE_COUNTERS_PER_STAGE,
+                ONLINE_COUNTERS_PER_STAGE,
+            ),
+            Segment::Completion => (
+                self.completion_start,
+                COMPLETION_COUNTERS_PER_STAGE,
+                COMPLETION_COUNTERS_PER_STAGE,
+            ),
+        };
+        (base + stage * stride, stride, length)
+    }
+
+    #[inline]
+    fn cell(self, segment: Segment, stage: usize, offset: usize) -> usize {
+        let (start, _, length) = self.geometry(segment, stage);
+        debug_assert!(stage < self.stage_count && offset < length);
+        start + offset
+    }
+
+    #[inline]
     pub(crate) fn local_index(self, stage: ValidatedStageIndex, bucket: Bucket) -> usize {
-        self.matrix.local_index(stage, bucket)
+        self.cell(Segment::Local, stage.index(), bucket.index())
     }
 
-    pub(crate) fn cumulative(self, stage: usize, bucket: usize) -> Option<usize> {
-        self.matrix.cumulative(stage, bucket)
-    }
-
+    #[inline]
     pub(crate) fn cumulative_index(self, stage: ValidatedStageIndex, bucket: Bucket) -> usize {
-        self.matrix.cumulative_index(stage, bucket)
+        self.cell(Segment::Cumulative, stage.index(), bucket.index())
     }
 
-    pub(crate) fn cause(
-        self,
-        destination: usize,
-        previous_cumulative: usize,
-        local: usize,
-    ) -> Option<usize> {
-        self.matrix.cause(destination, previous_cumulative, local)
-    }
-
+    #[inline]
     pub(crate) fn cause_index(
         self,
         destination: ValidatedStageIndex,
         previous_cumulative: Bucket,
         local: Bucket,
     ) -> usize {
-        self.matrix
-            .cause_index(destination, previous_cumulative, local)
+        self.cell(
+            Segment::Cause,
+            destination.index(),
+            previous_cumulative.index() * BUCKETS + local.index(),
+        )
     }
 
-    pub(crate) fn incoming(
-        self,
-        destination: usize,
-        previous_cumulative: usize,
-        cumulative_after: usize,
-    ) -> Option<usize> {
-        self.matrix
-            .incoming(destination, previous_cumulative, cumulative_after)
-    }
-
+    /// An `IncomingStageIndex` exists only for a destination after a
+    /// predecessor, so it is never the first stage.
+    #[inline]
     pub(crate) fn incoming_index(
         self,
         destination: IncomingStageIndex,
         previous_cumulative: Bucket,
         cumulative_after: Bucket,
     ) -> usize {
-        self.matrix
-            .incoming_index(destination, previous_cumulative, cumulative_after)
+        self.cell(
+            Segment::Incoming,
+            destination.destination(),
+            previous_cumulative.index() * BUCKETS + cumulative_after.index(),
+        )
     }
 
-    pub(crate) fn calibration(
-        self,
-        stage: usize,
-        distribution: CalibrationPopulation,
-        bucket: usize,
-    ) -> Option<usize> {
-        if stage >= self.stage_count || bucket >= CALIBRATION_BUCKETS {
-            return None;
-        }
-        self.calibration_start
-            .checked_add(
-                stage
-                    .checked_mul(CALIBRATION_DISTRIBUTIONS_PER_STAGE)?
-                    .checked_add(distribution.offset())?
-                    .checked_mul(CALIBRATION_BUCKETS)?,
-            )?
-            .checked_add(bucket)
-    }
-
+    #[inline]
     pub(crate) fn calibration_index(
         self,
         stage: ValidatedStageIndex,
-        distribution: CalibrationPopulation,
+        population: CalibrationPopulation,
         bucket: usize,
     ) -> usize {
         // The calibration bucket is raw; this release assertion was measured
         // free and keeps an invalid bucket from reaching another segment.
-        let stage = stage.index();
-        assert!(stage < self.stage_count && bucket < CALIBRATION_BUCKETS);
-        self.calibration_start
-            + (stage * CALIBRATION_DISTRIBUTIONS_PER_STAGE + distribution.offset())
-                * CALIBRATION_BUCKETS
-            + bucket
+        assert!(bucket < CALIBRATION_BUCKETS);
+        self.cell(Segment::Calibration(population), stage.index(), bucket)
     }
 
-    pub(crate) fn online(self, stage: usize, counter: usize) -> Option<usize> {
-        if stage >= self.stage_count || counter >= ONLINE_COUNTERS_PER_STAGE {
-            return None;
-        }
-        self.online_start
-            .checked_add(stage.checked_mul(ONLINE_COUNTERS_PER_STAGE)?)?
-            .checked_add(counter)
+    /// `counter` comes from one of the two online truth-table functions above.
+    #[inline]
+    pub(crate) fn online_index(self, stage: ValidatedStageIndex, counter: usize) -> usize {
+        self.cell(Segment::Online, stage.index(), counter)
     }
 
-    pub(crate) fn online_index(self, stage: ValidatedStageIndex, counter: OnlineCounter) -> usize {
-        // Both dimensions are bounded by construction; the debug assertion is
-        // defense in depth.
-        let (stage, counter) = (stage.index(), counter.index());
-        debug_assert!(stage < self.stage_count && counter < ONLINE_COUNTERS_PER_STAGE);
-        self.online_start + stage * ONLINE_COUNTERS_PER_STAGE + counter
-    }
-
-    pub(crate) fn completion(self, stage: usize, error: bool) -> Option<usize> {
-        if stage >= self.stage_count {
-            return None;
-        }
-        self.completion_start
-            .checked_add(stage.checked_mul(COMPLETION_COUNTERS_PER_STAGE)?)?
-            .checked_add(usize::from(error))
-    }
-
+    #[inline]
     pub(crate) fn completion_index(self, stage: ValidatedStageIndex, error: bool) -> usize {
-        // Measured free in release; kept as defense in depth.
-        let stage = stage.index();
-        assert!(stage < self.stage_count);
-        self.completion_start + stage * COMPLETION_COUNTERS_PER_STAGE + usize::from(error)
+        self.cell(Segment::Completion, stage.index(), usize::from(error))
     }
 
     pub(crate) fn diagnostic(self, diagnostic: DiagnosticCounter) -> usize {
         self.diagnostic_start + diagnostic.offset()
+    }
+
+    /// Checked cell lookup for tests: `offset` within `segment` at `stage`.
+    #[cfg(test)]
+    pub(crate) fn cell_at(self, stage: usize, segment: Segment, offset: usize) -> usize {
+        let range = self
+            .segment(stage, segment)
+            .expect("the test names a valid segment");
+        assert!(offset < range.len());
+        range.start + offset
     }
 }
 
@@ -309,7 +318,7 @@ pub(crate) struct Inner {
     pub(crate) stage_names: Box<[Box<str>]>,
     pub(crate) tail_quantile: f64,
     pub(crate) memory_estimate: MemoryEstimate,
-    pub(crate) layout: FixedStorageLayout,
+    pub(crate) layout: StorageLayout,
     pub(crate) counters: Box<[AtomicU64]>,
     pub(crate) calibration_state: AtomicU8,
     pub(crate) frozen_calibration: Box<[OnceLock<FrozenStageCalibration>]>,
@@ -326,7 +335,7 @@ impl Inner {
         stage_names: Box<[Box<str>]>,
         tail_quantile: f64,
         memory_estimate: MemoryEstimate,
-        layout: FixedStorageLayout,
+        layout: StorageLayout,
     ) -> Self {
         let mut counters = Vec::with_capacity(layout.counter_count());
         counters.resize_with(layout.counter_count(), || AtomicU64::new(0));
@@ -370,30 +379,99 @@ pub(crate) fn increment_counter(counter: &AtomicU64) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fixed_layout_segments_are_contiguous() {
-        let layout = FixedStorageLayout::new(6).unwrap();
-
-        assert_eq!(layout.matrix_counter_bytes(), Some(366_592));
-        assert_eq!(layout.calibration_counter_count(), 6 * 3 * 250);
-        assert_eq!(layout.online_counter_count(), 6 * 12);
-        assert_eq!(layout.completion_start, layout.online_start + 6 * 12);
-        assert_eq!(layout.completion_counter_count(), 6 * 2);
-        assert_eq!(layout.diagnostic_start, layout.completion_start + 6 * 2);
-        assert_eq!(layout.counter_count(), layout.diagnostic_start + 8);
+    fn all_segments() -> [Segment; 9] {
+        [
+            Segment::Local,
+            Segment::Cumulative,
+            Segment::Cause,
+            Segment::Incoming,
+            Segment::Calibration(CalibrationPopulation::Local),
+            Segment::Calibration(CalibrationPopulation::CumulativeAfter),
+            Segment::Calibration(CalibrationPopulation::PreviousCumulative),
+            Segment::Online,
+            Segment::Completion,
+        ]
     }
 
     #[test]
-    fn checked_fixed_layout_covers_the_maximum_stage_count() {
-        let layout = FixedStorageLayout::new(64).unwrap();
+    fn segments_and_diagnostics_cover_the_storage_exactly_once() {
+        let stages = 3;
+        let layout = StorageLayout::new(stages).unwrap();
+        let mut visits = vec![0_u8; layout.counter_count()];
 
-        assert_eq!(layout.matrix_counter_bytes(), Some(4_227_072));
-        assert_eq!(layout.calibration_counter_count(), 48_000);
-        assert_eq!(layout.online_counter_count(), 768);
-        assert_eq!(layout.completion_counter_count(), 128);
-        assert_eq!(layout.counter_count(), 577_288);
-        assert_eq!(FixedStorageLayout::new(0), None);
-        assert_eq!(FixedStorageLayout::new(usize::MAX), None);
+        for stage in 0..stages {
+            for segment in all_segments() {
+                if let Some(range) = layout.segment(stage, segment) {
+                    for index in range {
+                        visits[index] += 1;
+                    }
+                }
+            }
+        }
+        for diagnostic in [
+            DiagnosticCounter::InvalidStageMarks,
+            DiagnosticCounter::InvalidContextMarks,
+            DiagnosticCounter::NonMonotonicMarks,
+            DiagnosticCounter::ClockRegressions,
+            DiagnosticCounter::LatencyOverflows,
+            DiagnosticCounter::CumulativeOverflows,
+            DiagnosticCounter::CalibrationSamplesSkippedWhileFreezing,
+            DiagnosticCounter::OnlineSamplesSkippedMissingPreviousThreshold,
+        ] {
+            visits[layout.diagnostic(diagnostic)] += 1;
+        }
+
+        assert!(visits.iter().all(|visits| *visits == 1));
+    }
+
+    #[test]
+    fn segments_have_their_documented_lengths_and_order() {
+        let layout = StorageLayout::new(3).unwrap();
+        let length = |segment| layout.segment(1, segment).unwrap().len();
+
+        assert_eq!(length(Segment::Local), BUCKETS);
+        assert_eq!(length(Segment::Cause), BUCKETS * BUCKETS);
+        assert_eq!(length(Segment::Incoming), BUCKETS * BUCKETS);
+        assert_eq!(
+            length(Segment::Calibration(CalibrationPopulation::Local)),
+            CALIBRATION_BUCKETS
+        );
+        assert_eq!(length(Segment::Online), ONLINE_COUNTERS_PER_STAGE);
+        assert_eq!(length(Segment::Completion), 2);
+        let start = |stage, segment| layout.segment(stage, segment).unwrap().start;
+        assert_eq!(
+            start(2, Segment::Cause) - start(1, Segment::Cause),
+            BUCKETS * BUCKETS
+        );
+        assert_eq!(start(1, Segment::Incoming), layout.incoming_start);
+        assert_eq!(
+            start(2, Segment::Incoming) - start(1, Segment::Incoming),
+            BUCKETS * BUCKETS
+        );
+    }
+
+    #[test]
+    fn out_of_range_stages_and_the_first_incoming_matrix_have_no_segment() {
+        let layout = StorageLayout::new(2).unwrap();
+
+        assert_eq!(layout.segment(0, Segment::Incoming), None);
+        for segment in all_segments() {
+            assert_eq!(layout.segment(2, segment), None);
+        }
+    }
+
+    #[test]
+    fn checked_layout_arithmetic_covers_the_maximum_stage_count() {
+        let six = StorageLayout::new(6).unwrap();
+        assert_eq!(six.matrix_counter_count(), 45_824);
+        assert_eq!(six.calibration_counter_count(), 6 * 3 * 250);
+
+        let max = StorageLayout::new(64).unwrap();
+        assert_eq!(max.matrix_counter_count(), 528_384);
+        assert_eq!(max.calibration_counter_count(), 48_000);
+        assert_eq!(max.counter_count(), 577_288);
+        assert_eq!(StorageLayout::new(0), None);
+        assert_eq!(StorageLayout::new(usize::MAX), None);
     }
 
     #[test]
@@ -419,13 +497,12 @@ mod tests {
 
         let mut cells = Vec::new();
         for ((local_tail, cumulative_after_tail), expected) in first {
-            let cell = first_online_counter(local_tail, cumulative_after_tail).index();
+            let cell = first_online_counter(local_tail, cumulative_after_tail);
             assert_eq!(cell, expected);
             cells.push(cell);
         }
         for ((previous_tail, local_tail, cumulative_after_tail), expected) in predecessor {
-            let cell = predecessor_online_counter(previous_tail, local_tail, cumulative_after_tail)
-                .index();
+            let cell = predecessor_online_counter(previous_tail, local_tail, cumulative_after_tail);
             assert_eq!(cell, expected);
             cells.push(cell);
         }

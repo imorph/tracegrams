@@ -10,6 +10,7 @@ use crate::bucket::{
 use crate::init::{StageId, Tracegrams};
 use crate::recorder::{
     CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationPopulation,
+    Segment,
 };
 
 /// Availability of a threshold in a freeze report.
@@ -310,15 +311,14 @@ impl Tracegrams {
     }
 
     fn scan_population(&self, stage: StageId, population: CalibrationPopulation) -> PopulationScan {
-        let counts = (0..=calibration_bounds().len())
-            .map(|bucket| {
-                let index = self
-                    .inner
-                    .layout
-                    .calibration(stage.index(), population, bucket)
-                    .expect("registered stages and pinned buckets have storage");
-                self.inner.counters[index].load(Ordering::Relaxed)
-            })
+        let range = self
+            .inner
+            .layout
+            .segment(stage.index(), Segment::Calibration(population))
+            .expect("registered stages have calibration storage");
+        let counts = self.inner.counters[range]
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let samples = counts.iter().map(|count| u128::from(*count)).sum();
@@ -440,12 +440,13 @@ mod tests {
         let previous = tracegrams
             .inner
             .layout
-            .calibration(
+            .segment(
                 destination.index(),
-                CalibrationPopulation::PreviousCumulative,
-                previous_bucket,
+                Segment::Calibration(CalibrationPopulation::PreviousCumulative),
             )
-            .unwrap();
+            .unwrap()
+            .start
+            + previous_bucket;
         tracegrams.inner.increment(previous);
 
         assert_eq!(

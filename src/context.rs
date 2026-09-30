@@ -609,7 +609,7 @@ mod tests {
 
     use super::*;
     use crate::bucket::{BUCKETS, CALIBRATION_BUCKETS, bucketize};
-    use crate::recorder::FixedStorageLayout;
+    use crate::recorder::{Segment, StorageLayout};
 
     fn two_stage_recorder() -> (Tracegrams, StageId, StageId) {
         let mut builder = Tracegrams::builder();
@@ -696,7 +696,7 @@ mod tests {
 
     fn record_reference(
         counters: &mut [u64],
-        layout: FixedStorageLayout,
+        layout: StorageLayout,
         context: &mut ReferenceContext,
         stage: usize,
         local_ns: u64,
@@ -705,43 +705,49 @@ mod tests {
         let cumulative_ns = context.cumulative_ns.checked_add(local_ns).unwrap();
         let local_bucket = bucketize(local_ns, crate::bucket::default_bounds());
         let cumulative_bucket = bucketize(cumulative_ns, crate::bucket::default_bounds());
-        counters[layout.local(stage, local_bucket).unwrap()] += 1;
-        counters[layout.cumulative(stage, cumulative_bucket).unwrap()] += 1;
+        counters[layout.cell_at(stage, Segment::Local, local_bucket)] += 1;
+        counters[layout.cell_at(stage, Segment::Cumulative, cumulative_bucket)] += 1;
 
         if let Some(previous_bucket) = context.previous_cumulative_bucket {
-            counters[layout.cause(stage, previous_bucket, local_bucket).unwrap()] += 1;
-            counters[layout
-                .incoming(stage, previous_bucket, cumulative_bucket)
-                .unwrap()] += 1;
+            counters[layout.cell_at(
+                stage,
+                Segment::Cause,
+                previous_bucket * BUCKETS + local_bucket,
+            )] += 1;
+            counters[layout.cell_at(
+                stage,
+                Segment::Incoming,
+                previous_bucket * BUCKETS + cumulative_bucket,
+            )] += 1;
         }
 
         let calibration_local = bucketize(local_ns, crate::bucket::calibration_bounds());
         let calibration_after = bucketize(cumulative_ns, crate::bucket::calibration_bounds());
-        counters[layout
-            .calibration(stage, CalibrationPopulation::Local, calibration_local)
-            .unwrap()] += 1;
-        counters[layout
-            .calibration(
-                stage,
-                CalibrationPopulation::CumulativeAfter,
-                calibration_after,
-            )
-            .unwrap()] += 1;
+        counters[layout.cell_at(
+            stage,
+            Segment::Calibration(CalibrationPopulation::Local),
+            calibration_local,
+        )] += 1;
+        counters[layout.cell_at(
+            stage,
+            Segment::Calibration(CalibrationPopulation::CumulativeAfter),
+            calibration_after,
+        )] += 1;
         if context.previous_cumulative_bucket.is_some() {
             let calibration_previous =
                 bucketize(context.cumulative_ns, crate::bucket::calibration_bounds());
-            counters[layout
-                .calibration(
-                    stage,
-                    CalibrationPopulation::PreviousCumulative,
-                    calibration_previous,
-                )
-                .unwrap()] += 1;
+            counters[layout.cell_at(
+                stage,
+                Segment::Calibration(CalibrationPopulation::PreviousCumulative),
+                calibration_previous,
+            )] += 1;
         }
         if let Some(outcome) = outcome {
-            counters[layout
-                .completion(stage, matches!(outcome, Outcome::Error))
-                .unwrap()] += 1;
+            counters[layout.cell_at(
+                stage,
+                Segment::Completion,
+                usize::from(matches!(outcome, Outcome::Error)),
+            )] += 1;
         }
 
         context.cumulative_ns = cumulative_ns;
@@ -924,8 +930,7 @@ mod tests {
                 tracegrams
                     .inner
                     .layout
-                    .local(second.index(), BUCKETS - 1)
-                    .unwrap(),
+                    .cell_at(second.index(), Segment::Local, BUCKETS - 1),
             ),
             1
         );
@@ -1114,16 +1119,16 @@ mod tests {
             Outcome::Error,
         );
 
-        let success_completion = successful
-            .inner
-            .layout
-            .completion(success_stage.index(), false)
-            .unwrap();
-        let error_completion = successful
-            .inner
-            .layout
-            .completion(success_stage.index(), true)
-            .unwrap();
+        let success_completion = successful.inner.layout.cell_at(
+            success_stage.index(),
+            Segment::Completion,
+            usize::from(false),
+        );
+        let error_completion = successful.inner.layout.cell_at(
+            success_stage.index(),
+            Segment::Completion,
+            usize::from(true),
+        );
         let successful_counters = raw_counters(&successful);
         let failed_counters = raw_counters(&failed);
         for (index, (success, error)) in
@@ -1155,19 +1160,18 @@ mod tests {
                 tracegrams
                     .inner
                     .layout
-                    .cumulative(second.index(), BUCKETS - 1)
-                    .unwrap(),
+                    .cell_at(second.index(), Segment::Cumulative, BUCKETS - 1),
             ),
             1
         );
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .incoming(second.index(), BUCKETS - 1, BUCKETS - 1)
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    second.index(),
+                    Segment::Incoming,
+                    (BUCKETS - 1) * BUCKETS + BUCKETS - 1
+                ),
             ),
             1
         );
@@ -1207,23 +1211,18 @@ mod tests {
                 tracegrams
                     .inner
                     .layout
-                    .local(first.index(), BUCKETS - 1)
-                    .unwrap(),
+                    .cell_at(first.index(), Segment::Local, BUCKETS - 1),
             ),
             1
         );
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .calibration(
-                        first.index(),
-                        CalibrationPopulation::Local,
-                        CALIBRATION_BUCKETS - 1,
-                    )
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    first.index(),
+                    Segment::Calibration(CalibrationPopulation::Local),
+                    CALIBRATION_BUCKETS - 1
+                ),
             ),
             1
         );
@@ -1257,8 +1256,7 @@ mod tests {
                 bucket_only
                     .inner
                     .layout
-                    .local(first.index(), BUCKETS - 1)
-                    .unwrap(),
+                    .cell_at(first.index(), Segment::Local, BUCKETS - 1),
             ),
             1
         );
@@ -1356,44 +1354,44 @@ mod tests {
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .cause(db.index(), previous_bucket, local_bucket)
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    db.index(),
+                    Segment::Cause,
+                    previous_bucket * BUCKETS + local_bucket
+                ),
             ),
             1
         );
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .incoming(db.index(), previous_bucket, after_bucket)
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    db.index(),
+                    Segment::Incoming,
+                    previous_bucket * BUCKETS + after_bucket
+                ),
             ),
             1
         );
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .cause(skipped.index(), previous_bucket, local_bucket)
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    skipped.index(),
+                    Segment::Cause,
+                    previous_bucket * BUCKETS + local_bucket
+                ),
             ),
             0
         );
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .incoming(skipped.index(), previous_bucket, after_bucket)
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    skipped.index(),
+                    Segment::Incoming,
+                    previous_bucket * BUCKETS + after_bucket
+                ),
             ),
             0
         );
@@ -1429,8 +1427,7 @@ mod tests {
                 tracegrams
                     .inner
                     .layout
-                    .local(first.index(), ordinary_bucket)
-                    .unwrap(),
+                    .cell_at(first.index(), Segment::Local, ordinary_bucket),
             ),
             1
         );
@@ -1443,11 +1440,11 @@ mod tests {
                 total(
                     &tracegrams,
                     (0..CALIBRATION_BUCKETS).map(|bucket| {
-                        tracegrams
-                            .inner
-                            .layout
-                            .calibration(first.index(), distribution, bucket)
-                            .unwrap()
+                        tracegrams.inner.layout.cell_at(
+                            first.index(),
+                            Segment::Calibration(distribution),
+                            bucket,
+                        )
                     }),
                 ),
                 0
@@ -1479,19 +1476,18 @@ mod tests {
                 tracegrams
                     .inner
                     .layout
-                    .local(first.index(), ordinary_bucket)
-                    .unwrap(),
+                    .cell_at(first.index(), Segment::Local, ordinary_bucket),
             ),
             1
         );
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .cumulative(first.index(), ordinary_bucket)
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    first.index(),
+                    Segment::Cumulative,
+                    ordinary_bucket
+                ),
             ),
             1
         );
@@ -1499,11 +1495,11 @@ mod tests {
             total(
                 &tracegrams,
                 (0..BUCKETS).map(|bucket| {
-                    tracegrams
-                        .inner
-                        .layout
-                        .cause(first.index(), ordinary_bucket, bucket)
-                        .unwrap()
+                    tracegrams.inner.layout.cell_at(
+                        first.index(),
+                        Segment::Cause,
+                        ordinary_bucket * BUCKETS + bucket,
+                    )
                 }),
             ),
             0
@@ -1512,15 +1508,11 @@ mod tests {
             total(
                 &tracegrams,
                 (0..CALIBRATION_BUCKETS).map(|bucket| {
-                    tracegrams
-                        .inner
-                        .layout
-                        .calibration(
-                            first.index(),
-                            CalibrationPopulation::PreviousCumulative,
-                            bucket,
-                        )
-                        .unwrap()
+                    tracegrams.inner.layout.cell_at(
+                        first.index(),
+                        Segment::Calibration(CalibrationPopulation::PreviousCumulative),
+                        bucket,
+                    )
                 }),
             ),
             0
@@ -1528,15 +1520,11 @@ mod tests {
         assert_eq!(
             count(
                 &tracegrams,
-                tracegrams
-                    .inner
-                    .layout
-                    .calibration(
-                        first.index(),
-                        CalibrationPopulation::Local,
-                        calibration_bucket,
-                    )
-                    .unwrap(),
+                tracegrams.inner.layout.cell_at(
+                    first.index(),
+                    Segment::Calibration(CalibrationPopulation::Local),
+                    calibration_bucket
+                ),
             ),
             1
         );
@@ -1551,12 +1539,12 @@ mod tests {
         );
     }
 
-    /// Exhaustive agreement between the typed hot indexes and the checked raw
-    /// plane. Witnesses come only from their real producers: `validate_mark`,
+    /// Exhaustive agreement between the typed hot indexes and the checked
+    /// segment ranges. Witnesses come only from their real producers: `validate_mark`,
     /// `default_bucketize`, and the online truth-table functions.
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn typed_hot_indexes_agree_with_checked_indexes_on_every_valid_input() {
+    fn typed_hot_indexes_agree_with_segment_ranges_on_every_valid_input() {
         let stage_count = 3;
         let mut builder = Tracegrams::builder();
         let stages = (0..stage_count)
@@ -1609,18 +1597,20 @@ mod tests {
 
             for &bucket in &buckets {
                 assert_eq!(
-                    layout.local(destination, bucket.index()).unwrap(),
+                    layout.cell_at(destination, Segment::Local, bucket.index()),
                     layout.local_index(stage, bucket)
                 );
                 assert_eq!(
-                    layout.cumulative(destination, bucket.index()).unwrap(),
+                    layout.cell_at(destination, Segment::Cumulative, bucket.index()),
                     layout.cumulative_index(stage, bucket)
                 );
                 for &column in &buckets {
                     assert_eq!(
-                        layout
-                            .cause(destination, bucket.index(), column.index())
-                            .unwrap(),
+                        layout.cell_at(
+                            destination,
+                            Segment::Cause,
+                            bucket.index() * BUCKETS + column.index()
+                        ),
                         layout.cause_index(stage, bucket, column)
                     );
                 }
@@ -1628,22 +1618,20 @@ mod tests {
             for distribution in distributions {
                 for bucket in 0..CALIBRATION_BUCKETS {
                     assert_eq!(
-                        layout
-                            .calibration(destination, distribution, bucket)
-                            .unwrap(),
+                        layout.cell_at(destination, Segment::Calibration(distribution), bucket),
                         layout.calibration_index(stage, distribution, bucket)
                     );
                 }
             }
             for &counter in &online {
                 assert_eq!(
-                    layout.online(destination, counter.index()).unwrap(),
+                    layout.cell_at(destination, Segment::Online, counter),
                     layout.online_index(stage, counter)
                 );
             }
             for error in [false, true] {
                 assert_eq!(
-                    layout.completion(destination, error).unwrap(),
+                    layout.cell_at(destination, Segment::Completion, usize::from(error)),
                     layout.completion_index(stage, error)
                 );
             }
@@ -1667,9 +1655,11 @@ mod tests {
                 for &row in &buckets {
                     for &column in &buckets {
                         assert_eq!(
-                            layout
-                                .incoming(destination, row.index(), column.index())
-                                .unwrap(),
+                            layout.cell_at(
+                                destination,
+                                Segment::Incoming,
+                                row.index() * BUCKETS + column.index()
+                            ),
                             layout.incoming_index(incoming, row, column)
                         );
                     }

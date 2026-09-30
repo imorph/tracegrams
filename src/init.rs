@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::calibration::FrozenStageCalibration;
-use crate::recorder::{FixedStorageLayout, Inner};
+use crate::recorder::{Inner, StorageLayout};
 
 const DEFAULT_TAIL_QUANTILE: f64 = 0.99;
 const MAX_STAGES: usize = 64;
@@ -198,11 +198,11 @@ impl TracegramsBuilder {
         })
     }
 
-    fn storage_layout(&self) -> Result<FixedStorageLayout, InitError> {
+    fn storage_layout(&self) -> Result<StorageLayout, InitError> {
         if self.stage_names.is_empty() {
             return Err(InitError::NoStages);
         }
-        FixedStorageLayout::new(self.stage_names.len()).ok_or(InitError::SizeOverflow)
+        StorageLayout::new(self.stage_names.len()).ok_or(InitError::SizeOverflow)
     }
 }
 
@@ -278,23 +278,20 @@ fn claim_registry_cookie(source: &AtomicU64) -> Option<RegistryCookie> {
 }
 
 fn estimate_memory(
-    layout: FixedStorageLayout,
+    layout: StorageLayout,
     stage_name_lengths: impl IntoIterator<Item = usize>,
 ) -> Result<MemoryEstimate, InitError> {
     let counter_bytes = size_of::<AtomicU64>();
-    let matrix_bytes = layout
-        .matrix_counter_bytes()
-        .ok_or(InitError::SizeOverflow)?;
+    let matrix_bytes = checked_bytes(layout.matrix_counter_count(), counter_bytes)?;
     let calibration_bytes = checked_bytes(layout.calibration_counter_count(), counter_bytes)?;
+    // Online, completion, and diagnostic counters.
+    let auxiliary_bytes = checked_bytes(
+        layout.counter_count() - layout.matrix_counter_count() - layout.calibration_counter_count(),
+        counter_bytes,
+    )?;
     let calibration_threshold_bytes = checked_bytes(
         layout.stage_count(),
         size_of::<OnceLock<FrozenStageCalibration>>(),
-    )?;
-    let online_bytes = checked_bytes(layout.online_counter_count(), counter_bytes)?;
-    let completion_bytes = checked_bytes(layout.completion_counter_count(), counter_bytes)?;
-    let diagnostics_bytes = checked_bytes(
-        FixedStorageLayout::diagnostic_counter_count(),
-        counter_bytes,
     )?;
     let stage_headers = checked_bytes(layout.stage_count(), size_of::<Box<str>>())?;
     let stage_name_bytes = stage_name_lengths
@@ -314,11 +311,9 @@ fn estimate_memory(
     let total_bytes = [
         matrix_bytes,
         calibration_bytes,
+        auxiliary_bytes,
         calibration_threshold_bytes,
-        online_bytes,
         stage_metadata_bytes,
-        completion_bytes,
-        diagnostics_bytes,
         recorder_metadata_bytes,
     ]
     .into_iter()
@@ -391,7 +386,7 @@ mod tests {
 
     #[test]
     fn artificial_metadata_size_overflow_is_typed() {
-        let layout = FixedStorageLayout::new(1).unwrap();
+        let layout = StorageLayout::new(1).unwrap();
 
         assert_eq!(
             estimate_memory(layout, [usize::MAX]),

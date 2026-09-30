@@ -71,7 +71,6 @@ mod calibration;
 mod context;
 mod diagnose;
 mod init;
-mod matrix;
 mod recorder;
 mod snapshot;
 
