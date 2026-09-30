@@ -28,10 +28,10 @@ struct PreviousMark {
     cumulative_bucket: u8,
 }
 
-// Pack recorder identity, calibration epoch, and the previous mark into one
-// word so `Ctx` stays at three `u64`s.
+// Pack recorder identity, the started-after-freeze flag, and the previous
+// mark into one word so `Ctx` stays at three `u64`s.
 const COOKIE_MASK: u64 = 0xffff_ffff;
-const CALIBRATION_EPOCH_SHIFT: u32 = 32;
+const STARTED_FROZEN_BIT: u64 = 1 << 32;
 const PREVIOUS_STAGE_SHIFT: u32 = 48;
 const PREVIOUS_BUCKET_SHIFT: u32 = 54;
 const PREVIOUS_FIELD_MASK: u64 = 0x3f;
@@ -122,12 +122,16 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    fn new(last_timestamp_ns: u64, cookie: RegistryCookie, calibration_epoch: u16) -> Self {
+    fn new(last_timestamp_ns: u64, cookie: RegistryCookie, started_frozen: bool) -> Self {
         Self {
             last_timestamp_ns,
             cumulative_ns: 0,
             metadata: u64::from(cookie.raw())
-                | (u64::from(calibration_epoch) << CALIBRATION_EPOCH_SHIFT),
+                | if started_frozen {
+                    STARTED_FROZEN_BIT
+                } else {
+                    0
+                },
         }
     }
 
@@ -135,10 +139,8 @@ impl Ctx {
         self.metadata & COOKIE_MASK
     }
 
-    const fn calibration_epoch(&self) -> u16 {
-        #[allow(clippy::cast_possible_truncation)]
-        let epoch = (self.metadata >> CALIBRATION_EPOCH_SHIFT) as u16;
-        epoch
+    const fn started_frozen(&self) -> bool {
+        self.metadata & STARTED_FROZEN_BIT != 0
     }
 
     const fn previous(&self) -> Option<PreviousMark> {
@@ -170,7 +172,7 @@ impl fmt::Debug for Ctx {
             .debug_struct("Ctx")
             .field("last_timestamp_ns", &self.last_timestamp_ns)
             .field("cumulative_ns", &self.cumulative_ns)
-            .field("calibration_epoch", &self.calibration_epoch())
+            .field("started_frozen", &self.started_frozen())
             .field(
                 "previous_stage",
                 &self.previous().map(|previous| previous.stage),
@@ -238,7 +240,7 @@ struct MarkAdvance {
 pub struct ManualCtx {
     cumulative_ns: u64,
     cookie: RegistryCookie,
-    calibration_epoch: u16,
+    started_frozen: bool,
     previous: Option<PreviousMark>,
 }
 
@@ -247,7 +249,7 @@ impl fmt::Debug for ManualCtx {
         formatter
             .debug_struct("ManualCtx")
             .field("cumulative_ns", &self.cumulative_ns)
-            .field("calibration_epoch", &self.calibration_epoch)
+            .field("started_frozen", &self.started_frozen)
             .field(
                 "previous_stage",
                 &self.previous.map(|previous| previous.stage),
@@ -261,11 +263,7 @@ impl Tracegrams {
     #[inline]
     pub fn start(&self) -> Ctx {
         let reading = self.read_clock();
-        Ctx::new(
-            reading.timestamp_ns,
-            self.inner.cookie,
-            self.current_calibration_epoch(),
-        )
+        Ctx::new(reading.timestamp_ns, self.inner.cookie, self.is_frozen())
     }
 
     /// Records one wall-clock interval ending at `stage`.
@@ -288,7 +286,7 @@ impl Tracegrams {
         ManualCtx {
             cumulative_ns: 0,
             cookie: self.inner.cookie,
-            calibration_epoch: self.current_calibration_epoch(),
+            started_frozen: self.is_frozen(),
             previous: None,
         }
     }
@@ -362,7 +360,7 @@ impl Tracegrams {
             context.cumulative_ns,
             mark.stage,
             mark.previous,
-            context.calibration_epoch(),
+            context.started_frozen(),
             local_ns,
             latency_overflowed,
             outcome,
@@ -397,7 +395,7 @@ impl Tracegrams {
             context.cumulative_ns,
             mark.stage,
             mark.previous,
-            context.calibration_epoch,
+            context.started_frozen,
             local_ns,
             latency_overflowed,
             outcome,
@@ -464,7 +462,7 @@ impl Tracegrams {
         previous_cumulative_ns: u64,
         stage: ValidatedStageIndex,
         previous: Option<ValidatedPrevious>,
-        context_calibration_epoch: u16,
+        context_started_frozen: bool,
         local_ns: u64,
         latency_overflowed: bool,
         outcome: Option<Outcome>,
@@ -537,7 +535,7 @@ impl Tracegrams {
                 .inner
                 .increment_diagnostic(DiagnosticCounter::CalibrationSamplesSkippedWhileFreezing),
             CALIBRATION_FROZEN => self.record_frozen_online(
-                context_calibration_epoch,
+                context_started_frozen,
                 previous_cumulative_ns,
                 stage,
                 previous,
@@ -567,7 +565,7 @@ impl Tracegrams {
 
     fn record_frozen_online(
         &self,
-        context_calibration_epoch: u16,
+        context_started_frozen: bool,
         previous_cumulative_ns: u64,
         stage: ValidatedStageIndex,
         previous: Option<ValidatedPrevious>,
@@ -575,9 +573,8 @@ impl Tracegrams {
         cumulative_after_ns: u64,
     ) {
         // Requests started before threshold publication do not belong to the
-        // frozen epoch; classifying them would mix populations.
-        let frozen_epoch = self.inner.calibration_epoch.load(Ordering::Relaxed);
-        if context_calibration_epoch != frozen_epoch {
+        // frozen population; classifying them would mix populations.
+        if !context_started_frozen {
             return;
         }
         let Some(calibration) = self.inner.frozen_calibration[stage.index()].get().copied() else {
@@ -638,11 +635,11 @@ mod tests {
             .collect()
     }
 
-    fn context_state(context: &ManualCtx) -> (u64, RegistryCookie, u16, Option<PreviousMark>) {
+    fn context_state(context: &ManualCtx) -> (u64, RegistryCookie, bool, Option<PreviousMark>) {
         (
             context.cumulative_ns,
             context.cookie,
-            context.calibration_epoch,
+            context.started_frozen,
             context.previous,
         )
     }
@@ -756,10 +753,6 @@ mod tests {
         let (tracegrams, _, _) = two_stage_recorder();
         tracegrams
             .inner
-            .calibration_epoch
-            .store(u16::MAX, Ordering::Relaxed);
-        tracegrams
-            .inner
             .calibration_state
             .store(CALIBRATION_FROZEN, Ordering::Release);
         install_test_clock(&tracegrams, &[(u64::MAX, false)]);
@@ -773,12 +766,12 @@ mod tests {
         });
 
         assert_eq!(size_of::<Ctx>(), 24);
-        assert_eq!(size_of::<ManualCtx>(), 24);
+        assert_eq!(size_of::<ManualCtx>(), 16);
         assert_eq!(
             context.registry_cookie(),
             u64::from(tracegrams.inner.cookie.raw())
         );
-        assert_eq!(context.calibration_epoch(), u16::MAX);
+        assert!(context.started_frozen());
         assert_eq!(
             context.previous(),
             Some(PreviousMark {
@@ -820,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn clocked_finish_updates_the_frozen_online_epoch() {
+    fn clocked_finish_updates_the_frozen_online_counters() {
         let mut builder = Tracegrams::builder();
         let stage = builder.stage("stage").unwrap();
         let tracegrams = builder.build().unwrap();

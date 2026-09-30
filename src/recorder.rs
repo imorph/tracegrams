@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::bucket::{Bucket, CALIBRATION_BUCKETS, calibration_bounds, default_bounds};
@@ -159,10 +159,6 @@ impl FixedStorageLayout {
         self.online_count
     }
 
-    pub(crate) const fn online_start(self) -> usize {
-        self.online_start
-    }
-
     pub(crate) const fn completion_counter_count(self) -> usize {
         self.completion_count
     }
@@ -314,7 +310,6 @@ pub(crate) struct Inner {
     pub(crate) default_bounds: Box<[u64]>,
     pub(crate) calibration_bounds: Box<[u64]>,
     pub(crate) calibration_state: AtomicU8,
-    pub(crate) calibration_epoch: AtomicU16,
     pub(crate) frozen_calibration: Box<[OnceLock<FrozenStageCalibration>]>,
     pub(crate) clock_epoch: Instant,
     #[cfg(test)]
@@ -346,7 +341,6 @@ impl Inner {
             default_bounds: default_bounds().to_vec().into_boxed_slice(),
             calibration_bounds: calibration_bounds().to_vec().into_boxed_slice(),
             calibration_state: AtomicU8::new(CALIBRATION_COLLECTING),
-            calibration_epoch: AtomicU16::new(0),
             frozen_calibration: (0..layout.stage_count())
                 .map(|_| OnceLock::new())
                 .collect::<Vec<_>>()

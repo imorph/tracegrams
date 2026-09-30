@@ -5,8 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tracegrams::{
-    CalibrationPopulation, CalibrationState, Consistency, DeltaError, OnlineDeltaAvailability,
-    Outcome, Tracegrams,
+    CalibrationPopulation, CalibrationState, Consistency, DeltaError, Outcome, Tracegrams,
 };
 
 #[test]
@@ -54,7 +53,6 @@ fn snapshot_exposes_read_plane_metadata_counts_and_configuration() {
     assert_eq!(snapshot.calibration_bucket_bounds().len(), 249);
     assert!((snapshot.tail_quantile() - 0.95).abs() < f64::EPSILON);
     assert_eq!(snapshot.calibration_state(), CalibrationState::Collecting);
-    assert_eq!(snapshot.calibration_epoch(), 0);
     assert_eq!(snapshot.memory_budget_bytes(), 8 * 1024 * 1024);
     assert_eq!(snapshot.memory_estimate(), estimate);
 
@@ -99,10 +97,7 @@ fn delta_is_pure_checked_subtraction_for_an_incident_window() {
     let window = after.delta(&before).unwrap();
 
     assert_eq!(window.consistency(), Consistency::Relaxed);
-    assert_eq!(
-        window.online_delta_availability(),
-        OnlineDeltaAvailability::SameEpoch { epoch: 0 }
-    );
+    assert!(!window.spans_freeze());
     assert_eq!(window.local_counts(first).unwrap()[0], 1);
     assert_eq!(window.local_counts(second).unwrap()[0], 1);
     assert_eq!(window.cause_counts(second).unwrap()[0], 1);

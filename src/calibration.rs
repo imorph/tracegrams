@@ -315,16 +315,10 @@ impl StageCalibrationReport {
 /// Owned report from one relaxed freeze attempt.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FreezeReport {
-    epoch: Option<u16>,
     stages: Box<[StageCalibrationReport]>,
 }
 
 impl FreezeReport {
-    /// Returns the published epoch, or `None` for a failed range check.
-    pub const fn epoch(&self) -> Option<u16> {
-        self.epoch
-    }
-
     /// Returns selected stage reports in registration order.
     pub fn stages(&self) -> &[StageCalibrationReport] {
         &self.stages
@@ -363,10 +357,7 @@ pub enum FreezeError {
     /// Another caller currently owns the freeze transition.
     AlreadyFreezing,
     /// Calibration has already frozen successfully.
-    AlreadyFrozen {
-        /// Existing frozen epoch.
-        epoch: u16,
-    },
+    AlreadyFrozen,
     /// A selected quantile rank landed in a terminal bucket.
     CalibrationRangeInsufficient {
         /// Stage whose population selected a terminal bucket.
@@ -401,9 +392,7 @@ impl fmt::Display for FreezeError {
                 formatter.write_str("selected calibration populations are not ready")
             }
             Self::AlreadyFreezing => formatter.write_str("calibration is already freezing"),
-            Self::AlreadyFrozen { epoch } => {
-                write!(formatter, "calibration is already frozen at epoch {epoch}")
-            }
+            Self::AlreadyFrozen => formatter.write_str("calibration is already frozen"),
             Self::CalibrationRangeInsufficient {
                 stage,
                 population,
@@ -492,7 +481,7 @@ impl Tracegrams {
         match self.inner.calibration_state.load(Ordering::Acquire) {
             CALIBRATION_COLLECTING => {}
             CALIBRATION_FREEZING => return Err(FreezeError::AlreadyFreezing),
-            CALIBRATION_FROZEN => return Err(self.already_frozen()),
+            CALIBRATION_FROZEN => return Err(FreezeError::AlreadyFrozen),
             _ => unreachable!("calibration state has a fixed internal representation"),
         }
 
@@ -509,7 +498,7 @@ impl Tracegrams {
         ) {
             return Err(match observed {
                 CALIBRATION_FREEZING => FreezeError::AlreadyFreezing,
-                CALIBRATION_FROZEN => self.already_frozen(),
+                CALIBRATION_FROZEN => FreezeError::AlreadyFrozen,
                 _ => unreachable!("calibration state has a fixed internal representation"),
             });
         }
@@ -544,27 +533,21 @@ impl Tracegrams {
                 return Err(error);
             }
         };
-        let failed_report = FreezeReport {
-            epoch: None,
-            stages: stage_reports.clone().into_boxed_slice(),
-        };
         if let Some((stage, population, terminal)) = first_terminal(&stage_reports) {
             self.restore_collecting();
             return Err(FreezeError::CalibrationRangeInsufficient {
                 stage,
                 population,
                 terminal,
-                report: failed_report,
+                report: FreezeReport {
+                    stages: stage_reports.into_boxed_slice(),
+                },
             });
         }
 
-        // Build a clean online epoch: reset cells and publish thresholds
-        // before the release store below exposes the frozen state.
-        for index in self.inner.layout.online_start()
-            ..self.inner.layout.online_start() + self.inner.layout.online_counter_count()
-        {
-            self.inner.counters[index].store(0, Ordering::Relaxed);
-        }
+        // Online cells are written only in the frozen state, so they are still
+        // zero here. Publish thresholds before the release store below exposes
+        // the frozen state.
         for report in &stage_reports {
             let published = FrozenStageCalibration { report: *report };
             self.inner.frozen_calibration[report.stage.index()]
@@ -572,27 +555,20 @@ impl Tracegrams {
                 .expect("only the single successful freeze publishes thresholds");
         }
 
-        let epoch = 1;
-        self.inner.calibration_epoch.store(epoch, Ordering::Relaxed);
         self.inner
             .calibration_state
             .store(CALIBRATION_FROZEN, Ordering::Release);
         Ok(FreezeReport {
-            epoch: Some(epoch),
             stages: stage_reports.into_boxed_slice(),
         })
     }
 
-    pub(crate) fn current_calibration_epoch(&self) -> u16 {
-        if self.inner.calibration_state.load(Ordering::Acquire) == CALIBRATION_FROZEN {
-            self.inner.calibration_epoch.load(Ordering::Relaxed)
-        } else {
-            0
-        }
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.inner.calibration_state.load(Ordering::Acquire) == CALIBRATION_FROZEN
     }
 
     pub(crate) fn frozen_calibration_report(&self) -> Option<FreezeReport> {
-        if self.inner.calibration_state.load(Ordering::Acquire) != CALIBRATION_FROZEN {
+        if !self.is_frozen() {
             return None;
         }
         let stages = self
@@ -603,10 +579,7 @@ impl Tracegrams {
             .map(FrozenStageCalibration::report)
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Some(FreezeReport {
-            epoch: Some(self.inner.calibration_epoch.load(Ordering::Relaxed)),
-            stages,
-        })
+        Some(FreezeReport { stages })
     }
 
     fn validate_selection(&self, criteria: FreezeCriteria) -> Result<Vec<StageId>, FreezeError> {
@@ -752,12 +725,6 @@ impl Tracegrams {
             .calibration_state
             .store(CALIBRATION_COLLECTING, Ordering::Release);
     }
-
-    fn already_frozen(&self) -> FreezeError {
-        FreezeError::AlreadyFrozen {
-            epoch: self.inner.calibration_epoch.load(Ordering::Relaxed),
-        }
-    }
 }
 
 fn readiness_from_scans(scans: &[StageScan], minimum: u64) -> CalibrationReadiness {
@@ -858,10 +825,6 @@ mod tests {
         ));
         assert!(tracegrams.frozen_calibration_report().is_none());
         assert_eq!(
-            tracegrams.inner.calibration_epoch.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
             tracegrams.inner.calibration_state.load(Ordering::Acquire),
             CALIBRATION_COLLECTING
         );
@@ -927,48 +890,6 @@ mod tests {
                 .frozen_calibration
                 .iter()
                 .all(|published| published.get().is_none())
-        );
-    }
-
-    #[test]
-    fn successful_freeze_resets_every_online_counter_before_publication() {
-        let mut builder = Tracegrams::builder();
-        let stage = builder.stage("stage").unwrap();
-        let tracegrams = builder.build().unwrap();
-        tracegrams.record_elapsed(
-            &mut tracegrams.start_manual(),
-            stage,
-            Duration::from_nanos(100),
-        );
-        for counter in 0..crate::recorder::ONLINE_COUNTERS_PER_STAGE {
-            let index = tracegrams
-                .inner
-                .layout
-                .online(stage.index(), counter)
-                .unwrap();
-            tracegrams.inner.counters[index]
-                .store(u64::try_from(counter).unwrap() + 1, Ordering::Relaxed);
-        }
-        assert!(
-            tracegrams
-                .snapshot_relaxed()
-                .sample_counts(stage)
-                .unwrap()
-                .online()
-                > 0
-        );
-
-        tracegrams
-            .try_freeze_calibration(FreezeCriteria::all_stages(1))
-            .unwrap();
-
-        assert_eq!(
-            tracegrams
-                .snapshot_relaxed()
-                .sample_counts(stage)
-                .unwrap()
-                .online(),
-            0
         );
     }
 }

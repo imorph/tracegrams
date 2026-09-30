@@ -108,7 +108,7 @@ struct DiagnosticsModel {
 struct ContextModel {
     cumulative: u64,
     previous: Option<(usize, usize)>,
-    frozen_epoch: bool,
+    started_frozen: bool,
 }
 
 struct Model {
@@ -201,7 +201,7 @@ impl Model {
         }
 
         if self.frozen {
-            if context.frozen_epoch {
+            if context.started_frozen {
                 if context.previous.is_some() && !self.frozen_previous_threshold[stage] {
                     Self::increment(&mut self.diagnostics.online_missing_previous_threshold);
                 } else {
@@ -275,7 +275,7 @@ fn drive_request(
     };
     let mut actual = Some(owner.start_manual());
     let mut expected = ContextModel {
-        frozen_epoch: model.frozen,
+        started_frozen: model.frozen,
         ..ContextModel::default()
     };
     for (index, (stage, duration)) in request.marks.iter().copied().enumerate() {
@@ -325,7 +325,6 @@ fn assert_snapshot(snapshot: &Snapshot, stages: &[StageId], model: &Model) {
             CalibrationState::Collecting
         }
     );
-    assert_eq!(snapshot.calibration_epoch(), u16::from(model.frozen));
     assert_eq!(snapshot.calibration_report().is_some(), model.frozen);
     for (index, stage) in stages.iter().copied().enumerate() {
         let expected = &model.stages[index];
@@ -546,7 +545,7 @@ fn predecessor_online_sample_without_frozen_threshold_is_skipped() {
 
     let mut actual = recorder.start_manual();
     let mut expected = ContextModel {
-        frozen_epoch: true,
+        started_frozen: true,
         ..ContextModel::default()
     };
     recorder.record_elapsed(&mut actual, stages[0], Duration::from_nanos(200));

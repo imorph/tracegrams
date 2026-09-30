@@ -297,7 +297,6 @@ fn frozen_online_truth_cells_produce_the_exact_calibrated_formulas() {
     assert_eq!(scores.path(), ScorePath::CalibratedOnline);
     assert!(!scores.path().known_drift());
     assert_eq!(scores.population(), ScorePopulation::AllReachedMarks);
-    assert_eq!(scores.epoch(), 1);
     assert_eq!(scores.samples(), 6);
     assert_eq!(scores.first_samples(), 2);
     assert_eq!(scores.predecessor_samples(), 4);
@@ -352,7 +351,7 @@ fn first_marks_affect_only_clean_origin_and_onset_populations() {
 }
 
 #[test]
-fn pre_freeze_context_never_writes_the_published_online_epoch() {
+fn pre_freeze_context_never_writes_online_counters() {
     let mut builder = Tracegrams::builder();
     let stage = builder.stage("stage").unwrap();
     let tracegrams = builder.build().unwrap();
@@ -623,7 +622,6 @@ fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
             "tracegrams diagnosis: stage\n",
             "path: calibrated-online\n",
             "  population: all-reached marks (first=1, predecessor=0)\n",
-            "  epoch: 1\n",
             "  consistency: relaxed\n",
             "  thresholds_ns: local=104, previous_cumulative=n/a, cumulative_after=104\n",
             "  tail_onset: 1/1 = 1.000000\n",
@@ -653,7 +651,7 @@ fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
 }
 
 #[test]
-fn cross_epoch_delta_keeps_matrix_scores_but_disables_online_diagnosis() {
+fn cross_freeze_delta_keeps_matrix_scores_but_disables_online_diagnosis() {
     let mut builder = Tracegrams::builder();
     let first = builder.stage("first").unwrap();
     let destination = builder.stage("destination").unwrap();
@@ -676,20 +674,16 @@ fn cross_epoch_delta_keeps_matrix_scores_but_disables_online_diagnosis() {
         matrix_scores.classification(&DiagnoseConfig::experimental_defaults()),
         Classification::Inconclusive
     );
+    assert!(delta.spans_freeze());
+    assert_eq!(delta.sample_counts(destination).unwrap().online(), 1);
     assert_eq!(
         delta.calibrated_online_scores(destination).unwrap_err(),
-        DiagnoseError::EpochMismatch {
-            earlier: 0,
-            later: 1,
-        }
+        DiagnoseError::WindowSpansFreeze
     );
     assert_eq!(
         delta
             .diagnose(destination, &DiagnoseConfig::experimental_defaults())
             .unwrap_err(),
-        DiagnoseError::EpochMismatch {
-            earlier: 0,
-            later: 1,
-        }
+        DiagnoseError::WindowSpansFreeze
     );
 }

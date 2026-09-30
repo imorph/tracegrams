@@ -89,6 +89,5 @@ pub use diagnose::{
 pub use init::{InitError, MemoryEstimate, StageId, Tracegrams, TracegramsBuilder};
 pub use snapshot::{
     CalibrationPopulation, CalibrationState, CompletionCounts, Consistency, DeltaError,
-    DeltaSnapshot, Diagnostics, OnlineDeltaAvailability, SampleCounts, ScoreAvailability, Snapshot,
-    StageMetadata,
+    DeltaSnapshot, Diagnostics, SampleCounts, ScoreAvailability, Snapshot, StageMetadata,
 };

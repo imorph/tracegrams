@@ -21,24 +21,6 @@ pub enum Consistency {
     Relaxed,
 }
 
-/// Whether calibrated-online counters can be subtracted across a window.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum OnlineDeltaAvailability {
-    /// Both endpoints belong to the same online calibration epoch.
-    SameEpoch {
-        /// The shared epoch.
-        epoch: u16,
-    },
-    /// The endpoints belong to different online calibration epochs.
-    EpochMismatch {
-        /// Epoch observed in the earlier snapshot.
-        earlier: u16,
-        /// Epoch observed in the later snapshot.
-        later: u16,
-    },
-}
-
 /// A typed failure to subtract two snapshots.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -312,7 +294,6 @@ pub struct Snapshot {
     calibration_bucket_bounds: Box<[u64]>,
     tail_quantile: f64,
     calibration_state: CalibrationState,
-    calibration_epoch: u16,
     calibration_report: Option<FreezeReport>,
     memory_budget_bytes: usize,
     memory_estimate: MemoryEstimate,
@@ -354,11 +335,6 @@ impl Snapshot {
     /// Returns the observed calibration lifecycle state.
     pub const fn calibration_state(&self) -> CalibrationState {
         self.calibration_state
-    }
-
-    /// Returns the observed calibration epoch.
-    pub const fn calibration_epoch(&self) -> u16 {
-        self.calibration_epoch
     }
 
     /// Returns the immutable successful freeze report after publication.
@@ -489,25 +465,20 @@ impl Snapshot {
 
     /// Purely subtracts `earlier` from this later snapshot.
     ///
-    /// When the endpoints belong to different calibration epochs, online
-    /// counters are zeroed instead of subtracted and the window reports
-    /// [`OnlineDeltaAvailability::EpochMismatch`].
+    /// When exactly one endpoint observed the frozen state, the window spans
+    /// the calibration freeze: its online counters cover only contexts started
+    /// after the freeze, and online diagnosis of the window is rejected.
     pub fn delta(&self, earlier: &Self) -> Result<DeltaSnapshot, DeltaError> {
         if self.cookie != earlier.cookie {
             return Err(DeltaError::RegistryMismatch);
         }
-        let same_epoch = self.calibration_epoch == earlier.calibration_epoch;
-        let online_start = self.layout.online_start();
-        let online_end = online_start + self.layout.online_counter_count();
+        let spans_freeze = (self.calibration_state == CalibrationState::Frozen)
+            != (earlier.calibration_state == CalibrationState::Frozen);
         let counters = self
             .counters
             .iter()
             .zip(&earlier.counters)
-            .enumerate()
-            .map(|(index, (later, earlier))| {
-                if !same_epoch && (online_start..online_end).contains(&index) {
-                    return Ok(0);
-                }
+            .map(|(later, earlier)| {
                 later
                     .checked_sub(*earlier)
                     .ok_or(DeltaError::CounterUnderflow {
@@ -517,16 +488,6 @@ impl Snapshot {
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
-        let online_delta_availability = if same_epoch {
-            OnlineDeltaAvailability::SameEpoch {
-                epoch: self.calibration_epoch,
-            }
-        } else {
-            OnlineDeltaAvailability::EpochMismatch {
-                earlier: earlier.calibration_epoch,
-                later: self.calibration_epoch,
-            }
-        };
         let snapshot = Snapshot {
             cookie: self.cookie,
             stages: self.stages.clone(),
@@ -536,7 +497,6 @@ impl Snapshot {
             calibration_bucket_bounds: self.calibration_bucket_bounds.clone(),
             tail_quantile: self.tail_quantile,
             calibration_state: self.calibration_state,
-            calibration_epoch: self.calibration_epoch,
             calibration_report: self.calibration_report.clone(),
             memory_budget_bytes: self.memory_budget_bytes,
             memory_estimate: self.memory_estimate,
@@ -545,7 +505,7 @@ impl Snapshot {
 
         Ok(DeltaSnapshot {
             snapshot,
-            online_delta_availability,
+            spans_freeze,
         })
     }
 
@@ -576,11 +536,10 @@ impl Snapshot {
 
 /// Owned counter differences for a window between two relaxed snapshots.
 ///
-/// Cross-epoch online counters are zeroed, not subtracted.
 #[derive(Clone, Debug)]
 pub struct DeltaSnapshot {
     snapshot: Snapshot,
-    online_delta_availability: OnlineDeltaAvailability,
+    spans_freeze: bool,
 }
 
 impl DeltaSnapshot {
@@ -589,9 +548,9 @@ impl DeltaSnapshot {
         self.snapshot.consistency()
     }
 
-    /// Returns online-counter epoch comparability for this window.
-    pub const fn online_delta_availability(&self) -> OnlineDeltaAvailability {
-        self.online_delta_availability
+    /// Returns whether exactly one endpoint observed the frozen state.
+    pub const fn spans_freeze(&self) -> bool {
+        self.spans_freeze
     }
 
     /// Returns owned metadata for all stages in registration order.
@@ -622,11 +581,6 @@ impl DeltaSnapshot {
     /// Returns the calibration state observed at the later endpoint.
     pub const fn calibration_state(&self) -> CalibrationState {
         self.snapshot.calibration_state()
-    }
-
-    /// Returns the calibration epoch observed at the later endpoint.
-    pub const fn calibration_epoch(&self) -> u16 {
-        self.snapshot.calibration_epoch()
     }
 
     /// Returns the successful freeze report observed at the later endpoint.
@@ -685,10 +639,7 @@ impl DeltaSnapshot {
     /// Returns coarse score-path input availability for this window.
     pub fn score_availability(&self, stage: StageId) -> Option<ScoreAvailability> {
         let mut availability = self.snapshot.score_availability(stage)?;
-        if matches!(
-            self.online_delta_availability,
-            OnlineDeltaAvailability::EpochMismatch { .. }
-        ) {
+        if self.spans_freeze {
             availability.calibrated_online = false;
         }
         Some(availability)
@@ -747,11 +698,6 @@ impl Tracegrams {
             calibration_bucket_bounds: self.inner.calibration_bounds.clone(),
             tail_quantile: self.inner.tail_quantile,
             calibration_state,
-            calibration_epoch: if calibration_state == CalibrationState::Frozen {
-                self.inner.calibration_epoch.load(Ordering::Relaxed)
-            } else {
-                0
-            },
             calibration_report,
             memory_budget_bytes: self.inner.memory_budget_bytes,
             memory_estimate: self.inner.memory_estimate,
@@ -762,55 +708,13 @@ impl Tracegrams {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::context::Outcome;
 
     fn two_stage_recorder() -> (Tracegrams, StageId, StageId) {
         let mut builder = Tracegrams::builder();
         let first = builder.stage("first").unwrap();
         let second = builder.stage("second").unwrap();
         (builder.build().unwrap(), first, second)
-    }
-
-    #[test]
-    fn cross_epoch_delta_keeps_matrices_and_discards_online_counters() {
-        let (tracegrams, first, second) = two_stage_recorder();
-        let online = tracegrams.inner.layout.online(second.index(), 0).unwrap();
-        tracegrams.inner.counters[online].store(5, Ordering::Relaxed);
-        let earlier = tracegrams.snapshot_relaxed();
-
-        tracegrams.inner.counters[online].store(0, Ordering::Relaxed);
-        tracegrams
-            .inner
-            .calibration_epoch
-            .store(1, Ordering::Relaxed);
-        tracegrams
-            .inner
-            .calibration_state
-            .store(crate::recorder::CALIBRATION_FROZEN, Ordering::Release);
-        let mut context = tracegrams.start_manual();
-        tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(50));
-        tracegrams.finish_manual(context, second, Duration::from_nanos(75), Outcome::Success);
-        let later = tracegrams.snapshot_relaxed();
-
-        let delta = later.delta(&earlier).unwrap();
-        assert_eq!(
-            delta.online_delta_availability(),
-            OnlineDeltaAvailability::EpochMismatch {
-                earlier: 0,
-                later: 1,
-            }
-        );
-        assert_eq!(sum(delta.cause_counts(second).unwrap()), 1);
-        assert_eq!(delta.sample_counts(second).unwrap().online(), 0);
-        assert!(
-            !delta
-                .score_availability(second)
-                .unwrap()
-                .calibrated_online()
-        );
     }
 
     #[test]

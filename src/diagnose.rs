@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::bucket::{BUCKETS, RankSelection, nearest_rank};
 use crate::recorder::{ONLINE_COUNTERS_PER_STAGE, ONLINE_FIRST_COUNTERS};
-use crate::{DeltaSnapshot, OnlineDeltaAvailability, Snapshot, StageCalibrationReport, StageId};
+use crate::{DeltaSnapshot, Snapshot, StageCalibrationReport, StageId};
 
 /// The counter path from which a score was derived.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -659,7 +659,6 @@ impl CalibratedThresholds {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CalibratedOnlineScores {
     stage: StageId,
-    epoch: u16,
     thresholds: CalibratedThresholds,
     samples: u128,
     first_samples: u128,
@@ -687,11 +686,6 @@ impl CalibratedOnlineScores {
     /// Returns the all-reached population represented by the truth table.
     pub const fn population(self) -> ScorePopulation {
         ScorePopulation::AllReachedMarks
-    }
-
-    /// Returns the frozen online epoch.
-    pub const fn epoch(self) -> u16 {
-        self.epoch
     }
 
     /// Returns the frozen thresholds.
@@ -777,7 +771,6 @@ struct OnlineTotals {
 
 fn derive_calibrated_online_scores(
     stage: StageId,
-    epoch: u16,
     calibration: &StageCalibrationReport,
     counts: &[u64],
 ) -> Option<CalibratedOnlineScores> {
@@ -829,7 +822,6 @@ fn derive_calibrated_online_scores(
 
     Some(CalibratedOnlineScores {
         stage,
-        epoch,
         thresholds,
         samples: totals.first_samples + totals.predecessor_samples,
         first_samples: totals.first_samples,
@@ -969,23 +961,18 @@ pub enum DiagnoseError {
         /// Requested stage.
         stage: StageId,
     },
-    /// A delta spans online epochs whose truth-table counters are incomparable.
-    EpochMismatch {
-        /// Earlier endpoint epoch.
-        earlier: u16,
-        /// Later endpoint epoch.
-        later: u16,
-    },
+    /// A delta spans the calibration freeze, so its online counters cover
+    /// only part of the window.
+    WindowSpansFreeze,
 }
 
 impl fmt::Display for DiagnoseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotCalibrated { stage } => write!(formatter, "{stage:?} is not calibrated"),
-            Self::EpochMismatch { earlier, later } => write!(
-                formatter,
-                "online diagnosis cannot span calibration epochs {earlier} and {later}"
-            ),
+            Self::WindowSpansFreeze => {
+                formatter.write_str("online diagnosis cannot span the calibration freeze")
+            }
         }
     }
 }
@@ -1066,20 +1053,18 @@ impl Snapshot {
 }
 
 impl DeltaSnapshot {
-    /// Purely derives exact online scores for a same-epoch window.
+    /// Purely derives exact online scores for a window that does not span the freeze.
     pub fn calibrated_online_scores(
         &self,
         stage: StageId,
     ) -> Result<CalibratedOnlineScores, DiagnoseError> {
-        match self.online_delta_availability() {
-            OnlineDeltaAvailability::SameEpoch { .. } => derive_delta_online_scores(self, stage),
-            OnlineDeltaAvailability::EpochMismatch { earlier, later } => {
-                Err(DiagnoseError::EpochMismatch { earlier, later })
-            }
+        if self.spans_freeze() {
+            return Err(DiagnoseError::WindowSpansFreeze);
         }
+        derive_delta_online_scores(self, stage)
     }
 
-    /// Purely diagnoses one calibrated same-epoch window with both score paths.
+    /// Purely diagnoses one calibrated window that does not span the freeze with both score paths.
     pub fn diagnose(
         &self,
         stage: StageId,
@@ -1105,7 +1090,6 @@ fn derive_snapshot_online_scores(
         .ok_or(DiagnoseError::NotCalibrated { stage })?;
     derive_calibrated_online_scores(
         stage,
-        snapshot.calibration_epoch(),
         &calibration,
         snapshot
             .online_counts(stage)
@@ -1124,7 +1108,6 @@ fn derive_delta_online_scores(
         .ok_or(DiagnoseError::NotCalibrated { stage })?;
     derive_calibrated_online_scores(
         stage,
-        snapshot.calibration_epoch(),
         &calibration,
         snapshot
             .online_counts(stage)
@@ -1217,7 +1200,6 @@ fn display_online_scores(
         "  population: all-reached marks (first={}, predecessor={})",
         scores.first_samples, scores.predecessor_samples
     )?;
-    writeln!(formatter, "  epoch: {}", scores.epoch)?;
     writeln!(formatter, "  consistency: relaxed")?;
     write!(
         formatter,
@@ -1394,8 +1376,7 @@ mod tests {
         let counts: [u64; ONLINE_COUNTERS_PER_STAGE] =
             std::array::from_fn(|cell| u64::try_from(cell + 1).unwrap());
 
-        let scores =
-            derive_calibrated_online_scores(destination, 1, &calibration, &counts).unwrap();
+        let scores = derive_calibrated_online_scores(destination, &calibration, &counts).unwrap();
 
         assert_eq!(scores.samples(), 78);
         assert_eq!(scores.first_samples(), 10);

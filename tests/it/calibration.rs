@@ -39,7 +39,6 @@ fn all_stage_freeze_publishes_one_complete_relaxed_bundle() {
     let report = tracegrams
         .try_freeze_calibration(FreezeCriteria::all_stages(3))
         .unwrap();
-    assert_eq!(report.epoch(), Some(1));
     assert_eq!(report.stages().len(), 2);
     let entry_report = report.stage(entry).unwrap();
     assert_eq!(
@@ -67,7 +66,6 @@ fn all_stage_freeze_publishes_one_complete_relaxed_bundle() {
 
     let frozen = tracegrams.snapshot_relaxed();
     assert_eq!(frozen.calibration_state(), CalibrationState::Frozen);
-    assert_eq!(frozen.calibration_epoch(), 1);
     assert_eq!(frozen.calibration_report(), Some(&report));
 
     let before = frozen.sample_counts(entry).unwrap().calibration_local();
@@ -188,7 +186,7 @@ fn selected_stage_freeze_leaves_excluded_stages_uncalibrated() {
     );
     assert_eq!(
         tracegrams.try_freeze_calibration(FreezeCriteria::all_stages(2)),
-        Err(FreezeError::AlreadyFrozen { epoch: 1 })
+        Err(FreezeError::AlreadyFrozen)
     );
 }
 
@@ -245,7 +243,6 @@ fn lower_terminal_failure_retains_a_report_and_allows_finite_retry() {
     assert_eq!(failed_stage, stage);
     assert_eq!(population, CalibrationPopulation::Local);
     assert_eq!(terminal, CalibrationTerminal::Lower);
-    assert_eq!(report.epoch(), None);
     let estimate = report.stage(stage).unwrap().local().estimate().unwrap();
     assert_eq!(estimate.terminal(), CalibrationTerminal::Lower);
     assert_eq!(estimate.lower_bound(), None);
@@ -257,7 +254,6 @@ fn lower_terminal_failure_retains_a_report_and_allows_finite_retry() {
         failed_snapshot.calibration_state(),
         CalibrationState::Collecting
     );
-    assert_eq!(failed_snapshot.calibration_epoch(), 0);
     assert_eq!(failed_snapshot.calibration_report(), None);
 
     for _ in 0..100 {
@@ -342,7 +338,7 @@ fn concurrent_freezer_callers_have_exactly_one_winner() {
             .filter(|result| {
                 matches!(
                     result,
-                    Err(FreezeError::AlreadyFreezing | FreezeError::AlreadyFrozen { epoch: 1 })
+                    Err(FreezeError::AlreadyFreezing | FreezeError::AlreadyFrozen)
                 )
             })
             .count(),
@@ -376,7 +372,6 @@ fn invalid_selected_stage_criteria_are_typed_and_do_not_change_state() {
     );
     let snapshot = tracegrams.snapshot_relaxed();
     assert_eq!(snapshot.calibration_state(), CalibrationState::Collecting);
-    assert_eq!(snapshot.calibration_epoch(), 0);
     assert_eq!(snapshot.calibration_report(), None);
     assert_eq!(snapshot.diagnostics().total(), 0);
 }
@@ -409,7 +404,6 @@ fn concurrent_snapshots_never_observe_a_partial_threshold_bundle() {
         let snapshot = tracegrams.snapshot_relaxed();
         match snapshot.calibration_state() {
             CalibrationState::Collecting | CalibrationState::Freezing => {
-                assert_eq!(snapshot.calibration_epoch(), 0);
                 assert_eq!(snapshot.calibration_report(), None);
             }
             CalibrationState::Frozen => assert_complete_bundle(&snapshot, stages.len()),
@@ -424,9 +418,7 @@ fn concurrent_snapshots_never_observe_a_partial_threshold_bundle() {
 
 fn assert_complete_bundle(snapshot: &tracegrams::Snapshot, expected_stages: usize) {
     assert_eq!(snapshot.calibration_state(), CalibrationState::Frozen);
-    assert_eq!(snapshot.calibration_epoch(), 1);
     let report = snapshot.calibration_report().unwrap();
-    assert_eq!(report.epoch(), Some(1));
     assert_eq!(report.stages().len(), expected_stages);
     assert!(report.stages().iter().all(|stage| {
         stage.local().availability() == CalibrationThresholdAvailability::Available
