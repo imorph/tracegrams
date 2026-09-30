@@ -23,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tracegrams::{FreezeCriteria, Outcome, StageId, Tracegrams};
+use tracegrams::{DiagnoseConfig, Outcome, StageId, Tracegrams};
 
 const DEFAULT_CHECKPOINTS_PER_WRITER: u64 = 1_000_000;
 const DEFAULT_WARMUP_CHECKPOINTS_PER_WRITER: u64 = 50_000;
@@ -36,7 +36,7 @@ const MANUAL_TRANSITION_BUDGET_NS: f64 = 100.0;
 const CLOCKED_TRANSITION_BUDGET_NS: f64 = 180.0;
 const HOT_CELL_BUDGET_CHECKPOINTS_PER_SECOND: f64 = 2_000_000.0;
 const SNAPSHOT_BUDGET_NS: f64 = 100_000_000.0;
-const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+const MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() {
     // `cargo test --all-targets` executes harness-free benches. It should
@@ -293,7 +293,6 @@ struct SnapshotResult {
     median_ns: f64,
     median_absolute_deviation_ns: f64,
     exact_estimated_bytes: usize,
-    configured_budget_bytes: usize,
     checksum: u128,
 }
 
@@ -304,7 +303,6 @@ struct MemoryResult {
     calibration_bytes: usize,
     metadata_bytes: usize,
     exact_estimated_bytes: usize,
-    configured_budget_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -584,7 +582,7 @@ fn recorder_setup(frozen: bool, transition: bool) -> Result<RecorderSetup, Strin
             );
         }
         tracegrams
-            .try_freeze_calibration(FreezeCriteria::all_stages(1))
+            .try_freeze_calibration(1)
             .map_err(|error| error.to_string())?;
     }
     let spread_durations = bucket_representatives(&tracegrams)
@@ -716,21 +714,22 @@ fn run_concurrently(
             .completion_counts(destination)
             .ok_or_else(|| "completion counts disappeared from snapshot".to_owned())?;
         if operation.frozen() && operation.transition() {
-            let scores = delta
-                .calibrated_online_scores(destination)
+            let report = delta
+                .diagnose(destination, &DiagnoseConfig::experimental_defaults())
                 .map_err(|error| error.to_string())?;
+            let scores = report.calibrated_online();
             let request_count = u128::from(checkpoints_per_writer)
                 * u128::try_from(writers).map_err(|_| "writer count does not fit u128")?;
-            assert_eq!(scores.predecessor_samples(), request_count);
-            assert_eq!(scores.first_samples(), 0);
+            assert_eq!(scores.predecessor_samples, request_count);
+            assert_eq!(scores.first_samples, 0);
         }
         (
             delta.diagnostics().total(),
-            samples.local(),
-            u128::from(completion.success()) + u128::from(completion.error()),
-            samples.online(),
-            samples.cause(),
-            samples.incoming(),
+            samples.local,
+            u128::from(completion.success) + u128::from(completion.error),
+            samples.online,
+            samples.cause,
+            samples.incoming,
             delta
                 .local_counts(destination)
                 .unwrap_or_default()
@@ -854,7 +853,7 @@ fn measure_snapshot(stages: usize, repeats: usize) -> Result<SnapshotResult, Str
         let observed = snapshot
             .stages()
             .iter()
-            .map(|stage| snapshot.sample_counts(stage.id()).unwrap().local())
+            .map(|stage| snapshot.sample_counts(stage.id).unwrap().local)
             .sum::<u128>()
             .wrapping_add(snapshot.memory_estimate().total_bytes() as u128);
         if checksum
@@ -877,7 +876,6 @@ fn measure_snapshot(stages: usize, repeats: usize) -> Result<SnapshotResult, Str
         median_ns: median(&samples),
         median_absolute_deviation_ns: median_absolute_deviation(&samples),
         exact_estimated_bytes: snapshot.memory_estimate().total_bytes(),
-        configured_budget_bytes: snapshot.memory_budget_bytes(),
         checksum: checksum.unwrap_or(0),
     })
 }
@@ -888,11 +886,10 @@ fn measure_memory(stages: usize) -> Result<MemoryResult, String> {
     let estimate = snapshot.memory_estimate();
     Ok(MemoryResult {
         stages,
-        matrix_bytes: estimate.matrix_bytes(),
-        calibration_bytes: estimate.calibration_bytes(),
-        metadata_bytes: estimate.metadata_bytes(),
+        matrix_bytes: estimate.matrix_bytes,
+        calibration_bytes: estimate.calibration_bytes,
+        metadata_bytes: estimate.metadata_bytes,
         exact_estimated_bytes: estimate.total_bytes(),
-        configured_budget_bytes: snapshot.memory_budget_bytes(),
     })
 }
 
@@ -988,10 +985,10 @@ fn evaluate_budgets(
     budgets.push(BudgetResult {
         metric: "32-stage estimated memory".to_owned(),
         comparison: "<=",
-        budget: DEFAULT_MEMORY_BUDGET_BYTES as f64,
+        budget: MEMORY_BUDGET_BYTES as f64,
         observed: memory.exact_estimated_bytes as f64,
         unit: "bytes",
-        passed: memory.exact_estimated_bytes <= memory.configured_budget_bytes,
+        passed: memory.exact_estimated_bytes <= MEMORY_BUDGET_BYTES,
     });
     budgets
 }

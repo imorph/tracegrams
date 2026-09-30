@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use tracegrams::{
     CalibrationPopulation, CalibrationState, CalibrationTerminal, CalibrationThresholdAvailability,
-    FreezeCriteria, FreezeError, PopulationReadiness, Tracegrams,
+    FreezeError, Tracegrams,
 };
 
 #[test]
-fn all_stage_freeze_publishes_one_complete_relaxed_bundle() {
+fn freeze_publishes_one_complete_relaxed_bundle() {
     let mut builder = Tracegrams::builder();
     let entry = builder.stage("entry").unwrap();
     let db = builder.stage("db").unwrap();
@@ -22,53 +22,40 @@ fn all_stage_freeze_publishes_one_complete_relaxed_bundle() {
         tracegrams.record_elapsed(&mut context, db, Duration::from_nanos(200));
     }
 
-    let readiness = tracegrams.calibration_readiness(3);
-    assert!(readiness.is_ready());
-    assert!(matches!(
-        readiness.stage(entry).unwrap().previous_cumulative(),
-        PopulationReadiness::AbsentNoPredecessor
-    ));
-    assert!(matches!(
-        readiness.stage(db).unwrap().previous_cumulative(),
-        PopulationReadiness::Ready {
-            samples: 3,
-            minimum: 3
-        }
-    ));
-
-    let report = tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(3))
-        .unwrap();
-    assert_eq!(report.stages().len(), 2);
+    let report = tracegrams.try_freeze_calibration(3).unwrap();
+    assert_eq!(report.stages.len(), 2);
     let entry_report = report.stage(entry).unwrap();
+    assert_eq!(entry_report.local.population, CalibrationPopulation::Local);
+    assert_eq!(entry_report.local.samples, 3);
     assert_eq!(
-        entry_report.local().population(),
-        CalibrationPopulation::Local
-    );
-    assert_eq!(entry_report.local().samples(), 3);
-    assert_eq!(
-        entry_report.local().availability(),
+        entry_report.local.availability(),
         CalibrationThresholdAvailability::Available
     );
-    let estimate = entry_report.local().estimate().unwrap();
-    assert_eq!(estimate.rank(), 3);
-    assert_eq!(estimate.samples(), 3);
-    assert_eq!(estimate.lower_bound(), Some(100));
-    assert_eq!(estimate.upper_bound(), Some(108));
-    assert_eq!(estimate.value(), Some(104));
-    assert_eq!(estimate.terminal(), CalibrationTerminal::Finite);
+    let estimate = entry_report.local.estimate.unwrap();
+    assert_eq!(estimate.rank, 3);
+    assert_eq!(estimate.samples, 3);
+    assert_eq!(estimate.lower_bound, Some(100));
+    assert_eq!(estimate.upper_bound, Some(108));
+    assert_eq!(estimate.value, Some(104));
+    assert_eq!(estimate.terminal, CalibrationTerminal::Finite);
     assert_eq!(
-        entry_report.previous_cumulative().availability(),
+        entry_report.previous_cumulative.availability(),
         CalibrationThresholdAvailability::AbsentNoPredecessor
     );
-    assert_eq!(entry_report.previous_cumulative().samples(), 0);
-    assert_eq!(entry_report.previous_cumulative().estimate(), None);
+    assert_eq!(entry_report.previous_cumulative.samples, 0);
+    assert_eq!(entry_report.previous_cumulative.estimate, None);
+    let db_previous = report.stage(db).unwrap().previous_cumulative;
+    assert_eq!(db_previous.samples, 3);
+    assert_eq!(
+        db_previous.availability(),
+        CalibrationThresholdAvailability::Available
+    );
 
     let frozen = tracegrams.snapshot_relaxed();
     assert_eq!(frozen.calibration_state(), CalibrationState::Frozen);
     assert_eq!(frozen.calibration_report(), Some(&report));
 
-    let before = frozen.sample_counts(entry).unwrap().calibration_local();
+    let before = frozen.sample_counts(entry).unwrap().calibration_local;
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         entry,
@@ -76,144 +63,105 @@ fn all_stage_freeze_publishes_one_complete_relaxed_bundle() {
     );
     let after = tracegrams.snapshot_relaxed();
     assert_eq!(
-        after.sample_counts(entry).unwrap().calibration_local(),
+        after.sample_counts(entry).unwrap().calibration_local,
         before
     );
     assert_eq!(
         after
             .diagnostics()
-            .calibration_samples_skipped_while_freezing(),
+            .calibration_samples_skipped_while_freezing,
         0
     );
-}
-
-#[test]
-fn previous_population_readiness_distinguishes_absent_insufficient_and_ready() {
-    let mut builder = Tracegrams::builder();
-    let first = builder.stage("first").unwrap();
-    let destination = builder.stage("destination").unwrap();
-    let tracegrams = builder.build().unwrap();
-
-    for _ in 0..3 {
-        tracegrams.record_elapsed(
-            &mut tracegrams.start_manual(),
-            destination,
-            Duration::from_nanos(200),
-        );
-    }
     assert_eq!(
-        tracegrams
-            .calibration_readiness(3)
-            .stage(destination)
-            .unwrap()
-            .previous_cumulative(),
-        PopulationReadiness::AbsentNoPredecessor
-    );
-
-    let mut context = tracegrams.start_manual();
-    tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
-    tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(200));
-    let one_previous = tracegrams.calibration_readiness(3);
-    assert_eq!(
-        one_previous
-            .stage(destination)
-            .unwrap()
-            .previous_cumulative(),
-        PopulationReadiness::Insufficient {
-            samples: 1,
-            minimum: 3,
-        }
-    );
-    assert!(matches!(
-        tracegrams.try_freeze_calibration(FreezeCriteria::all_stages(3)),
-        Err(FreezeError::NotReady { .. })
-    ));
-    assert_eq!(
-        tracegrams.snapshot_relaxed().calibration_state(),
-        CalibrationState::Collecting
-    );
-
-    for _ in 0..2 {
-        let mut context = tracegrams.start_manual();
-        tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
-        tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(200));
-    }
-    assert_eq!(
-        tracegrams
-            .calibration_readiness(3)
-            .stage(destination)
-            .unwrap()
-            .previous_cumulative(),
-        PopulationReadiness::Ready {
-            samples: 3,
-            minimum: 3,
-        }
-    );
-}
-
-#[test]
-fn selected_stage_freeze_leaves_excluded_stages_uncalibrated() {
-    let mut builder = Tracegrams::builder();
-    let entry = builder.stage("entry").unwrap();
-    let db = builder.stage("db").unwrap();
-    let rare = builder.stage("rare").unwrap();
-    let tracegrams = builder.build().unwrap();
-
-    for _ in 0..2 {
-        let mut context = tracegrams.start_manual();
-        tracegrams.record_elapsed(&mut context, entry, Duration::from_nanos(100));
-        tracegrams.record_elapsed(&mut context, db, Duration::from_nanos(200));
-    }
-    assert!(!tracegrams.calibration_readiness(2).is_ready());
-
-    let report = tracegrams
-        .try_freeze_calibration(FreezeCriteria::for_stages(&[entry, db], 2))
-        .unwrap();
-    assert!(report.stage(entry).is_some());
-    assert_eq!(
-        report
-            .stage(entry)
-            .unwrap()
-            .previous_cumulative()
-            .availability(),
-        CalibrationThresholdAvailability::AbsentNoPredecessor
-    );
-    assert!(report.stage(db).is_some());
-    assert!(report.stage(rare).is_none());
-    assert_eq!(
-        tracegrams.snapshot_relaxed().calibration_report().unwrap(),
-        &report
-    );
-    assert_eq!(
-        tracegrams.try_freeze_calibration(FreezeCriteria::all_stages(2)),
+        tracegrams.try_freeze_calibration(3),
         Err(FreezeError::AlreadyFrozen)
     );
 }
 
 #[test]
-fn selected_stage_report_follows_registration_order() {
+fn empty_required_population_is_not_ready_even_with_a_zero_minimum() {
     let mut builder = Tracegrams::builder();
     let first = builder.stage("first").unwrap();
-    let second = builder.stage("second").unwrap();
-    let third = builder.stage("third").unwrap();
+    let never_reached = builder.stage("never-reached").unwrap();
     let tracegrams = builder.build().unwrap();
-    let mut context = tracegrams.start_manual();
-    tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
-    tracegrams.record_elapsed(&mut context, second, Duration::from_nanos(100));
-    tracegrams.record_elapsed(&mut context, third, Duration::from_nanos(100));
-
-    let report = tracegrams
-        .try_freeze_calibration(FreezeCriteria::for_stages(&[third, first], 1))
-        .unwrap();
+    tracegrams.record_elapsed(
+        &mut tracegrams.start_manual(),
+        first,
+        Duration::from_nanos(200),
+    );
 
     assert_eq!(
+        tracegrams.try_freeze_calibration(0),
+        Err(FreezeError::NotReady {
+            stage: never_reached,
+            population: CalibrationPopulation::Local,
+            samples: 0,
+            minimum: 0,
+        })
+    );
+    assert_eq!(
+        tracegrams.snapshot_relaxed().calibration_state(),
+        CalibrationState::Collecting
+    );
+}
+
+#[test]
+fn observed_previous_population_must_reach_the_minimum() {
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let destination = builder.stage("destination").unwrap();
+    let tracegrams = builder.build().unwrap();
+
+    // First marks alone make every required population ready while the
+    // destination's previous-cumulative population stays absent.
+    for stage in [first, destination] {
+        for _ in 0..3 {
+            tracegrams.record_elapsed(
+                &mut tracegrams.start_manual(),
+                stage,
+                Duration::from_nanos(200),
+            );
+        }
+    }
+    let record_pair = || {
+        let mut context = tracegrams.start_manual();
+        tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
+        tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(200));
+    };
+
+    record_pair();
+    assert_eq!(
+        tracegrams.try_freeze_calibration(3),
+        Err(FreezeError::NotReady {
+            stage: destination,
+            population: CalibrationPopulation::PreviousCumulative,
+            samples: 1,
+            minimum: 3,
+        })
+    );
+    assert_eq!(
+        tracegrams.snapshot_relaxed().calibration_state(),
+        CalibrationState::Collecting
+    );
+
+    record_pair();
+    record_pair();
+    let report = tracegrams.try_freeze_calibration(3).unwrap();
+    assert_eq!(
         report
-            .stages()
-            .iter()
-            .copied()
-            .map(tracegrams::StageCalibrationReport::stage)
-            .collect::<Vec<_>>(),
-        vec![first, third]
+            .stage(destination)
+            .unwrap()
+            .previous_cumulative
+            .samples,
+        3
+    );
+    assert_eq!(
+        report
+            .stage(first)
+            .unwrap()
+            .previous_cumulative
+            .availability(),
+        CalibrationThresholdAvailability::AbsentNoPredecessor
     );
 }
 
@@ -228,9 +176,7 @@ fn lower_terminal_failure_retains_a_report_and_allows_finite_retry() {
         Duration::from_nanos(50),
     );
 
-    let error = tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap_err();
+    let error = tracegrams.try_freeze_calibration(1).unwrap_err();
     let FreezeError::CalibrationRangeInsufficient {
         stage: failed_stage,
         population,
@@ -243,12 +189,17 @@ fn lower_terminal_failure_retains_a_report_and_allows_finite_retry() {
     assert_eq!(failed_stage, stage);
     assert_eq!(population, CalibrationPopulation::Local);
     assert_eq!(terminal, CalibrationTerminal::Lower);
-    let estimate = report.stage(stage).unwrap().local().estimate().unwrap();
-    assert_eq!(estimate.terminal(), CalibrationTerminal::Lower);
-    assert_eq!(estimate.lower_bound(), None);
-    assert_eq!(estimate.upper_bound(), Some(100));
-    assert_eq!(estimate.value(), None);
-    assert_eq!(estimate.max_relative_error(), None);
+    let local = report.stage(stage).unwrap().local;
+    assert_eq!(
+        local.availability(),
+        CalibrationThresholdAvailability::RangeInsufficient
+    );
+    let estimate = local.estimate.unwrap();
+    assert_eq!(estimate.terminal, CalibrationTerminal::Lower);
+    assert_eq!(estimate.lower_bound, None);
+    assert_eq!(estimate.upper_bound, Some(100));
+    assert_eq!(estimate.value, None);
+    assert_eq!(estimate.max_relative_error, None);
     let failed_snapshot = tracegrams.snapshot_relaxed();
     assert_eq!(
         failed_snapshot.calibration_state(),
@@ -263,17 +214,15 @@ fn lower_terminal_failure_retains_a_report_and_allows_finite_retry() {
             Duration::from_nanos(100),
         );
     }
-    let retry = tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
-    let estimate = retry.stage(stage).unwrap().local().estimate().unwrap();
-    assert_eq!(estimate.terminal(), CalibrationTerminal::Finite);
-    assert!(estimate.value().is_some());
-    assert!(estimate.max_relative_error().is_some());
+    let retry = tracegrams.try_freeze_calibration(1).unwrap();
+    let estimate = retry.stage(stage).unwrap().local.estimate.unwrap();
+    assert_eq!(estimate.terminal, CalibrationTerminal::Finite);
+    assert!(estimate.value.is_some());
+    assert!(estimate.max_relative_error.is_some());
 }
 
 #[test]
-fn upper_terminal_failure_can_retry_with_an_amended_selector() {
+fn upper_terminal_failure_names_the_out_of_range_stage() {
     let mut builder = Tracegrams::builder();
     let stable = builder.stage("stable").unwrap();
     let out_of_range = builder.stage("out-of-range").unwrap();
@@ -283,23 +232,16 @@ fn upper_terminal_failure_can_retry_with_an_amended_selector() {
     tracegrams.record_elapsed(&mut context, out_of_range, Duration::from_secs(10));
 
     assert!(matches!(
-        tracegrams.try_freeze_calibration(FreezeCriteria::all_stages(1)),
+        tracegrams.try_freeze_calibration(1),
         Err(FreezeError::CalibrationRangeInsufficient {
             stage,
             terminal: CalibrationTerminal::Upper,
             ..
         }) if stage == out_of_range
     ));
-    assert_eq!(
-        tracegrams.snapshot_relaxed().calibration_state(),
-        CalibrationState::Collecting
-    );
-
-    let report = tracegrams
-        .try_freeze_calibration(FreezeCriteria::for_stages(&[stable], 1))
-        .unwrap();
-    assert!(report.stage(stable).is_some());
-    assert!(report.stage(out_of_range).is_none());
+    let snapshot = tracegrams.snapshot_relaxed();
+    assert_eq!(snapshot.calibration_state(), CalibrationState::Collecting);
+    assert_eq!(snapshot.calibration_report(), None);
 }
 
 #[test]
@@ -322,7 +264,7 @@ fn concurrent_freezer_callers_have_exactly_one_winner() {
         let barrier = Arc::clone(&barrier);
         callers.push(std::thread::spawn(move || {
             barrier.wait();
-            tracegrams.try_freeze_calibration(FreezeCriteria::all_stages(1))
+            tracegrams.try_freeze_calibration(1)
         }));
     }
     barrier.wait();
@@ -351,32 +293,6 @@ fn concurrent_freezer_callers_have_exactly_one_winner() {
 }
 
 #[test]
-fn invalid_selected_stage_criteria_are_typed_and_do_not_change_state() {
-    let mut builder = Tracegrams::builder();
-    let stage = builder.stage("stage").unwrap();
-    let tracegrams = builder.build().unwrap();
-    let mut foreign_builder = Tracegrams::builder();
-    let foreign = foreign_builder.stage("foreign").unwrap();
-
-    assert_eq!(
-        tracegrams.try_freeze_calibration(FreezeCriteria::for_stages(&[], 1)),
-        Err(FreezeError::NoStagesSelected)
-    );
-    assert_eq!(
-        tracegrams.try_freeze_calibration(FreezeCriteria::for_stages(&[foreign], 1)),
-        Err(FreezeError::InvalidStageSelection { stage: foreign })
-    );
-    assert_eq!(
-        tracegrams.try_freeze_calibration(FreezeCriteria::for_stages(&[stage, stage], 1)),
-        Err(FreezeError::DuplicateStageSelection { stage })
-    );
-    let snapshot = tracegrams.snapshot_relaxed();
-    assert_eq!(snapshot.calibration_state(), CalibrationState::Collecting);
-    assert_eq!(snapshot.calibration_report(), None);
-    assert_eq!(snapshot.diagnostics().total(), 0);
-}
-
-#[test]
 fn concurrent_snapshots_never_observe_a_partial_threshold_bundle() {
     let mut builder = Tracegrams::builder();
     let mut stages = Vec::new();
@@ -393,9 +309,7 @@ fn concurrent_snapshots_never_observe_a_partial_threshold_bundle() {
     let freezer_tracegrams = Arc::clone(&tracegrams);
     let freezer_done = Arc::clone(&done);
     let freezer = std::thread::spawn(move || {
-        let report = freezer_tracegrams
-            .try_freeze_calibration(FreezeCriteria::all_stages(1))
-            .unwrap();
+        let report = freezer_tracegrams.try_freeze_calibration(1).unwrap();
         freezer_done.store(true, Ordering::Release);
         report
     });
@@ -419,10 +333,9 @@ fn concurrent_snapshots_never_observe_a_partial_threshold_bundle() {
 fn assert_complete_bundle(snapshot: &tracegrams::Snapshot, expected_stages: usize) {
     assert_eq!(snapshot.calibration_state(), CalibrationState::Frozen);
     let report = snapshot.calibration_report().unwrap();
-    assert_eq!(report.stages().len(), expected_stages);
-    assert!(report.stages().iter().all(|stage| {
-        stage.local().availability() == CalibrationThresholdAvailability::Available
-            && stage.cumulative_after().availability()
-                == CalibrationThresholdAvailability::Available
+    assert_eq!(report.stages.len(), expected_stages);
+    assert!(report.stages.iter().all(|stage| {
+        stage.local.availability() == CalibrationThresholdAvailability::Available
+            && stage.cumulative_after.availability() == CalibrationThresholdAvailability::Available
     }));
 }

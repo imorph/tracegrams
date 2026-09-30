@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::bucket::{Bucket, CALIBRATION_BUCKETS, calibration_bounds, default_bounds};
+use crate::bucket::{Bucket, CALIBRATION_BUCKETS};
 use crate::calibration::FrozenStageCalibration;
 use crate::context::{IncomingStageIndex, ValidatedStageIndex};
 use crate::init::{MemoryEstimate, RegistryCookie};
@@ -57,14 +57,19 @@ pub(crate) fn predecessor_online_counter(
 const COMPLETION_COUNTERS_PER_STAGE: usize = 2;
 const DIAGNOSTIC_COUNTERS: usize = 8;
 
+/// A calibration distribution stored for each stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CalibrationDistribution {
+#[non_exhaustive]
+pub enum CalibrationPopulation {
+    /// Local latency at the stage.
     Local,
+    /// Cumulative latency after the stage.
     CumulativeAfter,
+    /// Cumulative latency before predecessor-bearing marks.
     PreviousCumulative,
 }
 
-impl CalibrationDistribution {
+impl CalibrationPopulation {
     const fn offset(self) -> usize {
         match self {
             Self::Local => 0,
@@ -229,7 +234,7 @@ impl FixedStorageLayout {
     pub(crate) fn calibration(
         self,
         stage: usize,
-        distribution: CalibrationDistribution,
+        distribution: CalibrationPopulation,
         bucket: usize,
     ) -> Option<usize> {
         if stage >= self.stage_count || bucket >= CALIBRATION_BUCKETS {
@@ -248,7 +253,7 @@ impl FixedStorageLayout {
     pub(crate) fn calibration_index(
         self,
         stage: ValidatedStageIndex,
-        distribution: CalibrationDistribution,
+        distribution: CalibrationPopulation,
         bucket: usize,
     ) -> usize {
         // The calibration bucket is raw; this release assertion was measured
@@ -303,12 +308,9 @@ pub(crate) struct Inner {
     pub(crate) cookie: RegistryCookie,
     pub(crate) stage_names: Box<[Box<str>]>,
     pub(crate) tail_quantile: f64,
-    pub(crate) memory_budget_bytes: usize,
     pub(crate) memory_estimate: MemoryEstimate,
     pub(crate) layout: FixedStorageLayout,
     pub(crate) counters: Box<[AtomicU64]>,
-    pub(crate) default_bounds: Box<[u64]>,
-    pub(crate) calibration_bounds: Box<[u64]>,
     pub(crate) calibration_state: AtomicU8,
     pub(crate) frozen_calibration: Box<[OnceLock<FrozenStageCalibration>]>,
     pub(crate) clock_epoch: Instant,
@@ -323,7 +325,6 @@ impl Inner {
         cookie: RegistryCookie,
         stage_names: Box<[Box<str>]>,
         tail_quantile: f64,
-        memory_budget_bytes: usize,
         memory_estimate: MemoryEstimate,
         layout: FixedStorageLayout,
     ) -> Self {
@@ -334,12 +335,9 @@ impl Inner {
             cookie,
             stage_names,
             tail_quantile,
-            memory_budget_bytes,
             memory_estimate,
             layout,
             counters: counters.into_boxed_slice(),
-            default_bounds: default_bounds().to_vec().into_boxed_slice(),
-            calibration_bounds: calibration_bounds().to_vec().into_boxed_slice(),
             calibration_state: AtomicU8::new(CALIBRATION_COLLECTING),
             frozen_calibration: (0..layout.stage_count())
                 .map(|_| OnceLock::new())

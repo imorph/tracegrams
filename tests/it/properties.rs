@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
-use tracegrams::{
-    CalibrationPopulation, CalibrationState, FreezeCriteria, Outcome, Snapshot, StageId, Tracegrams,
-};
+use tracegrams::{CalibrationPopulation, CalibrationState, Outcome, Snapshot, StageId, Tracegrams};
 
 const STAGES: usize = 3;
 const WARMUP_REQUESTS: usize = 40;
@@ -364,67 +362,57 @@ fn assert_snapshot(snapshot: &Snapshot, stages: &[StageId], model: &Model) {
         }
         let samples = snapshot.sample_counts(stage).unwrap();
         assert_sample_counts(samples, expected, &cause);
-        let availability = snapshot.score_availability(stage).unwrap();
-        assert_eq!(
-            availability.matrix_derived(),
-            expected.cause.iter().flatten().any(|count| *count != 0)
-                && expected.incoming.iter().flatten().any(|count| *count != 0)
-        );
-        assert_eq!(
-            availability.calibrated_online(),
-            model.frozen && expected.online != 0
-        );
         let completions = snapshot.completion_counts(stage).unwrap();
         assert_eq!(
-            (completions.success(), completions.error()),
+            (completions.success, completions.error),
             (expected.success, expected.error)
         );
     }
     let actual = snapshot.diagnostics();
     let expected = model.diagnostics;
-    assert_eq!(actual.invalid_stage_marks(), expected.invalid_stage);
-    assert_eq!(actual.invalid_context_marks(), expected.invalid_context);
-    assert_eq!(actual.non_monotonic_marks(), expected.non_monotonic);
-    assert_eq!(actual.latency_overflows(), expected.latency_overflow);
-    assert_eq!(actual.cumulative_overflows(), expected.cumulative_overflow);
-    assert_eq!(actual.clock_regressions(), 0);
-    assert_eq!(actual.calibration_samples_skipped_while_freezing(), 0);
+    assert_eq!(actual.invalid_stage_marks, expected.invalid_stage);
+    assert_eq!(actual.invalid_context_marks, expected.invalid_context);
+    assert_eq!(actual.non_monotonic_marks, expected.non_monotonic);
+    assert_eq!(actual.latency_overflows, expected.latency_overflow);
+    assert_eq!(actual.cumulative_overflows, expected.cumulative_overflow);
+    assert_eq!(actual.clock_regressions, 0);
+    assert_eq!(actual.calibration_samples_skipped_while_freezing, 0);
     assert_eq!(
-        actual.online_samples_skipped_missing_previous_threshold(),
+        actual.online_samples_skipped_missing_previous_threshold,
         expected.online_missing_previous_threshold
     );
 }
 
 fn assert_sample_counts(samples: tracegrams::SampleCounts, expected: &StageModel, cause: &[u64]) {
     assert_eq!(
-        samples.local(),
+        samples.local,
         expected.local.iter().map(|v| u128::from(*v)).sum()
     );
     assert_eq!(
-        samples.cumulative_after(),
+        samples.cumulative_after,
         expected.cumulative.iter().map(|v| u128::from(*v)).sum()
     );
-    assert_eq!(samples.cause(), cause.iter().map(|v| u128::from(*v)).sum());
+    assert_eq!(samples.cause, cause.iter().map(|v| u128::from(*v)).sum());
     let incoming_total = expected
         .incoming
         .iter()
         .flatten()
         .map(|v| u128::from(*v))
         .sum();
-    assert_eq!(samples.incoming(), incoming_total);
+    assert_eq!(samples.incoming, incoming_total);
     assert_eq!(
-        samples.calibration_local(),
+        samples.calibration_local,
         expected.calibration[0].iter().map(|v| u128::from(*v)).sum()
     );
     assert_eq!(
-        samples.calibration_cumulative_after(),
+        samples.calibration_cumulative_after,
         expected.calibration[1].iter().map(|v| u128::from(*v)).sum()
     );
     assert_eq!(
-        samples.calibration_previous_cumulative(),
+        samples.calibration_previous_cumulative,
         expected.calibration[2].iter().map(|v| u128::from(*v)).sum()
     );
-    assert_eq!(samples.online(), u128::from(expected.online));
+    assert_eq!(samples.online, u128::from(expected.online));
 }
 
 fn run_case(before: &[Request], after: &[Request]) {
@@ -482,9 +470,7 @@ fn run_case(before: &[Request], after: &[Request]) {
         Duration::from_nanos(101),
         None,
     );
-    recorder
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    recorder.try_freeze_calibration(1).unwrap();
     model.freeze();
     recorder.finish_manual(
         stale_actual,
@@ -538,9 +524,7 @@ fn predecessor_online_sample_without_frozen_threshold_is_skipped() {
             None,
         );
     }
-    recorder
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    recorder.try_freeze_calibration(1).unwrap();
     model.freeze();
 
     let mut actual = recorder.start_manual();

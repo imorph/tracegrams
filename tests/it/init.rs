@@ -12,7 +12,6 @@ fn readme_style_initialization_builds_a_shared_handle() -> Result<(), InitError>
     assert_ne!(db, render);
 
     builder.tail_quantile(0.99)?;
-    builder.memory_budget_bytes(8 * 1024 * 1024);
     let tracegrams = builder.build()?;
     let cloned = tracegrams.clone();
 
@@ -22,17 +21,18 @@ fn readme_style_initialization_builds_a_shared_handle() -> Result<(), InitError>
 }
 
 #[test]
-fn one_six_and_sixty_four_stage_registries_fit_the_default_budget() {
-    for stage_count in [1, 6, 64] {
-        let mut builder = Tracegrams::builder();
-        for stage in 0..stage_count {
-            builder.stage(&format!("stage-{stage}")).unwrap();
-        }
-
-        let estimate = builder.estimated_memory().unwrap();
-        assert!(estimate.total_bytes() <= 8 * 1024 * 1024);
-        builder.build().unwrap();
+fn the_largest_registry_stays_below_five_megabytes() {
+    let mut builder = Tracegrams::builder();
+    for stage in 0..64 {
+        builder.stage(&format!("stage-{stage}")).unwrap();
     }
+
+    let estimate = builder
+        .build()
+        .unwrap()
+        .snapshot_relaxed()
+        .memory_estimate();
+    assert!(estimate.total_bytes() < 5_000_000);
 }
 
 #[test]
@@ -96,28 +96,16 @@ fn memory_estimate_is_itemized_and_pins_the_matrix_formula() {
         builder.stage(name).unwrap();
     }
 
-    let estimate = builder.estimated_memory().unwrap();
-    assert_eq!(estimate.matrix_bytes(), 366_592);
-    assert_eq!(estimate.calibration_bytes(), 6 * 6_000);
-    assert!(estimate.metadata_bytes() > 0);
+    let estimate = builder
+        .build()
+        .unwrap()
+        .snapshot_relaxed()
+        .memory_estimate();
+    assert_eq!(estimate.matrix_bytes, 366_592);
+    assert_eq!(estimate.calibration_bytes, 6 * 6_000);
+    assert!(estimate.metadata_bytes > 0);
     assert_eq!(
         estimate.total_bytes(),
-        estimate.matrix_bytes() + estimate.calibration_bytes() + estimate.metadata_bytes()
+        estimate.matrix_bytes + estimate.calibration_bytes + estimate.metadata_bytes
     );
-}
-
-#[test]
-fn build_rejects_an_estimate_above_the_budget() {
-    let mut builder = Tracegrams::builder();
-    builder.stage("only").unwrap();
-    let required = builder.estimated_memory().unwrap().total_bytes();
-    builder.memory_budget_bytes(required - 1);
-
-    assert!(matches!(
-        builder.build(),
-        Err(InitError::MemoryBudgetExceeded {
-            required: actual_required,
-            budget,
-        }) if actual_required == required && budget == required - 1
-    ));
 }

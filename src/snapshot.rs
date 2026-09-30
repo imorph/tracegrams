@@ -1,25 +1,17 @@
-//! Owned relaxed scans of recorder counters.
+//! Owned relaxed scans of recorder counters and windows between them.
 
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::Ordering;
 
-use crate::bucket::BUCKETS;
+use crate::bucket::{BUCKETS, calibration_bounds, default_bounds};
 use crate::calibration::FreezeReport;
 use crate::init::{MemoryEstimate, RegistryCookie, StageId, Tracegrams};
 use crate::recorder::{
-    CalibrationDistribution, DiagnosticCounter, FixedStorageLayout, ONLINE_COUNTERS_PER_STAGE,
+    CalibrationPopulation, DiagnosticCounter, FixedStorageLayout, ONLINE_COUNTERS_PER_STAGE,
 };
 
 const MATRIX_CELLS: usize = BUCKETS * BUCKETS;
-
-/// Consistency guarantee attached to read-plane data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum Consistency {
-    /// Cells were loaded atomically, but the scan has no single instant.
-    Relaxed,
-}
 
 /// A typed failure to subtract two snapshots.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,159 +67,51 @@ impl CalibrationState {
     }
 }
 
-/// A calibration distribution stored for each stage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum CalibrationPopulation {
-    /// Local latency at the stage.
-    Local,
-    /// Cumulative latency after the stage.
-    CumulativeAfter,
-    /// Cumulative latency before predecessor-bearing marks.
-    PreviousCumulative,
-}
-
-impl CalibrationPopulation {
-    const fn distribution(self) -> CalibrationDistribution {
-        match self {
-            Self::Local => CalibrationDistribution::Local,
-            Self::CumulativeAfter => CalibrationDistribution::CumulativeAfter,
-            Self::PreviousCumulative => CalibrationDistribution::PreviousCumulative,
-        }
-    }
-}
-
 /// Per-population sample totals observed for one stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SampleCounts {
-    local: u128,
-    cumulative_after: u128,
-    cause: u128,
-    incoming: u128,
-    calibration_local: u128,
-    calibration_cumulative_after: u128,
-    calibration_previous_cumulative: u128,
-    online: u128,
-}
-
-impl SampleCounts {
-    /// Returns ordinary local-distribution samples.
-    pub const fn local(self) -> u128 {
-        self.local
-    }
-
-    /// Returns ordinary cumulative-after-distribution samples.
-    pub const fn cumulative_after(self) -> u128 {
-        self.cumulative_after
-    }
-
-    /// Returns predecessor-bearing cause-matrix samples.
-    pub const fn cause(self) -> u128 {
-        self.cause
-    }
-
-    /// Returns predecessor-bearing incoming-matrix samples.
-    pub const fn incoming(self) -> u128 {
-        self.incoming
-    }
-
-    /// Returns local calibration samples.
-    pub const fn calibration_local(self) -> u128 {
-        self.calibration_local
-    }
-
-    /// Returns cumulative-after calibration samples.
-    pub const fn calibration_cumulative_after(self) -> u128 {
-        self.calibration_cumulative_after
-    }
-
-    /// Returns previous-cumulative calibration samples.
-    pub const fn calibration_previous_cumulative(self) -> u128 {
-        self.calibration_previous_cumulative
-    }
-
-    /// Returns calibrated-online truth-table samples.
-    pub const fn online(self) -> u128 {
-        self.online
-    }
-}
-
-/// Coarse availability of each score path's raw inputs.
-///
-/// Individual scores may still be unavailable because their denominator is
-/// zero or because a relaxed scan observed only part of a checkpoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ScoreAvailability {
-    matrix_derived: bool,
-    calibrated_online: bool,
-}
-
-impl ScoreAvailability {
-    /// Returns whether both destination matrices contain predecessor samples.
-    pub const fn matrix_derived(self) -> bool {
-        self.matrix_derived
-    }
-
-    /// Returns whether frozen online truth-table samples are present.
-    pub const fn calibrated_online(self) -> bool {
-        self.calibrated_online
-    }
+    /// Ordinary local-distribution samples.
+    pub local: u128,
+    /// Ordinary cumulative-after-distribution samples.
+    pub cumulative_after: u128,
+    /// Predecessor-bearing cause-matrix samples.
+    pub cause: u128,
+    /// Predecessor-bearing incoming-matrix samples.
+    pub incoming: u128,
+    /// Local calibration samples.
+    pub calibration_local: u128,
+    /// Cumulative-after calibration samples.
+    pub calibration_cumulative_after: u128,
+    /// Previous-cumulative calibration samples.
+    pub calibration_previous_cumulative: u128,
+    /// Calibrated-online truth-table samples.
+    pub online: u128,
 }
 
 /// Snapshot-visible hot-path anomaly and rejection counters.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Diagnostics {
-    invalid_stage_marks: u64,
-    invalid_context_marks: u64,
-    non_monotonic_marks: u64,
-    clock_regressions: u64,
-    latency_overflows: u64,
-    cumulative_overflows: u64,
-    calibration_samples_skipped_while_freezing: u64,
-    online_samples_skipped_missing_previous_threshold: u64,
+    /// Marks carrying a stage from another registry.
+    pub invalid_stage_marks: u64,
+    /// Marks carrying a context from another registry.
+    pub invalid_context_marks: u64,
+    /// Repeated or decreasing stage marks.
+    pub non_monotonic_marks: u64,
+    /// Rejected clock readings earlier than the context timestamp.
+    pub clock_regressions: u64,
+    /// Local durations outside the exact `u64` nanosecond range.
+    pub latency_overflows: u64,
+    /// Cumulative-duration additions that overflowed `u64`.
+    pub cumulative_overflows: u64,
+    /// Calibration samples skipped while a freeze was in progress.
+    pub calibration_samples_skipped_while_freezing: u64,
+    /// Online samples skipped because no previous threshold exists.
+    pub online_samples_skipped_missing_previous_threshold: u64,
 }
 
 impl Diagnostics {
-    /// Returns marks carrying a stage from another registry.
-    pub const fn invalid_stage_marks(self) -> u64 {
-        self.invalid_stage_marks
-    }
-
-    /// Returns marks carrying a context from another registry.
-    pub const fn invalid_context_marks(self) -> u64 {
-        self.invalid_context_marks
-    }
-
-    /// Returns repeated or decreasing stage marks.
-    pub const fn non_monotonic_marks(self) -> u64 {
-        self.non_monotonic_marks
-    }
-
-    /// Returns rejected clock readings earlier than the context timestamp.
-    pub const fn clock_regressions(self) -> u64 {
-        self.clock_regressions
-    }
-
-    /// Returns local durations outside the exact `u64` nanosecond range.
-    pub const fn latency_overflows(self) -> u64 {
-        self.latency_overflows
-    }
-
-    /// Returns cumulative-duration additions that overflowed `u64`.
-    pub const fn cumulative_overflows(self) -> u64 {
-        self.cumulative_overflows
-    }
-
-    /// Returns calibration samples skipped while a freeze was in progress.
-    pub const fn calibration_samples_skipped_while_freezing(self) -> u64 {
-        self.calibration_samples_skipped_while_freezing
-    }
-
-    /// Returns online samples skipped because no previous threshold exists.
-    pub const fn online_samples_skipped_missing_previous_threshold(self) -> u64 {
-        self.online_samples_skipped_missing_previous_threshold
-    }
-
     /// Returns the sum of all diagnostic counters without `u64` overflow.
     pub const fn total(self) -> u128 {
         self.invalid_stage_marks as u128
@@ -243,88 +127,63 @@ impl Diagnostics {
 
 /// Owned metadata for one registered stage.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct StageMetadata {
-    id: StageId,
-    name: Box<str>,
-}
-
-impl StageMetadata {
-    /// Returns the registry-branded stage identifier.
-    pub const fn id(&self) -> StageId {
-        self.id
-    }
-
-    /// Returns the registered stage name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
+    /// Registry-branded stage identifier.
+    pub id: StageId,
+    /// Registered stage name.
+    pub name: Box<str>,
 }
 
 /// Success and error completions observed for one stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct CompletionCounts {
-    success: u64,
-    error: u64,
+    /// Successful completions.
+    pub success: u64,
+    /// Error completions.
+    pub error: u64,
 }
 
-impl CompletionCounts {
-    /// Returns successful completions.
-    pub const fn success(self) -> u64 {
-        self.success
-    }
-
-    /// Returns error completions.
-    pub const fn error(self) -> u64 {
-        self.error
-    }
-}
-
-/// An owned scan of one recorder's atomic counters.
+/// An owned relaxed scan of one recorder's counters, or the window between
+/// two such scans.
 ///
 /// Each cell was loaded atomically, but concurrent checkpoints may be only
 /// partly represented. The snapshot remains valid after all recorder handles
 /// are dropped.
+///
+/// [`Snapshot::delta`] returns a window with the same type: every accessor
+/// reports counter differences, and calibration state and report are those of
+/// the later endpoint. The type does not distinguish a window from an absolute
+/// scan; callers that need absolute counts must keep track of which one they
+/// hold.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     cookie: RegistryCookie,
     stages: Box<[StageMetadata]>,
     layout: FixedStorageLayout,
     counters: Box<[u64]>,
-    bucket_bounds: Box<[u64]>,
-    calibration_bucket_bounds: Box<[u64]>,
     tail_quantile: f64,
     calibration_state: CalibrationState,
     calibration_report: Option<FreezeReport>,
-    memory_budget_bytes: usize,
     memory_estimate: MemoryEstimate,
-    consistency: Consistency,
+    spans_freeze: bool,
 }
 
 impl Snapshot {
-    /// Returns the explicitly weak consistency guarantee for this scan.
-    pub const fn consistency(&self) -> Consistency {
-        self.consistency
-    }
-
     /// Returns owned metadata for all stages in registration order.
     pub fn stages(&self) -> &[StageMetadata] {
         &self.stages
     }
 
-    /// Returns the registered name when `stage` belongs to this snapshot.
-    pub fn stage_name(&self, stage: StageId) -> Option<&str> {
-        let stage = self.stage_index(stage)?;
-        Some(self.stages[stage].name())
-    }
-
     /// Returns the pinned ordinary bucket bounds; each bound starts the next bucket.
-    pub fn bucket_bounds(&self) -> &[u64] {
-        &self.bucket_bounds
+    pub fn bucket_bounds(&self) -> &'static [u64] {
+        default_bounds()
     }
 
     /// Returns the pinned calibration-grid bounds, using the same convention.
-    pub fn calibration_bucket_bounds(&self) -> &[u64] {
-        &self.calibration_bucket_bounds
+    pub fn calibration_bucket_bounds(&self) -> &'static [u64] {
+        calibration_bounds()
     }
 
     /// Returns the configured calibration tail quantile.
@@ -342,14 +201,18 @@ impl Snapshot {
         self.calibration_report.as_ref()
     }
 
-    /// Returns the recorder's configured memory budget.
-    pub const fn memory_budget_bytes(&self) -> usize {
-        self.memory_budget_bytes
-    }
-
     /// Returns the recorder's itemized owned-memory estimate.
     pub const fn memory_estimate(&self) -> MemoryEstimate {
         self.memory_estimate
+    }
+
+    /// Returns whether this window spans the calibration freeze.
+    ///
+    /// Such a window's online counters cover only contexts started after the
+    /// freeze, so online diagnosis rejects it. Always `false` for a scan
+    /// returned by [`Tracegrams::snapshot_relaxed`].
+    pub const fn spans_freeze(&self) -> bool {
+        self.spans_freeze
     }
 
     /// Returns the local-latency distribution for `stage`.
@@ -384,11 +247,9 @@ impl Snapshot {
         population: CalibrationPopulation,
     ) -> Option<&[u64]> {
         let stage = self.stage_index(stage)?;
-        let start = self
-            .layout
-            .calibration(stage, population.distribution(), 0)?;
+        let start = self.layout.calibration(stage, population, 0)?;
         self.counters
-            .get(start..start + self.calibration_bucket_bounds.len() + 1)
+            .get(start..start + calibration_bounds().len() + 1)
     }
 
     pub(crate) fn online_counts(&self, stage: StageId) -> Option<&[u64]> {
@@ -399,37 +260,18 @@ impl Snapshot {
 
     /// Returns totals for every stored sample population at `stage`.
     pub fn sample_counts(&self, stage: StageId) -> Option<SampleCounts> {
-        self.stage_index(stage)?;
-        let local = sum(self.local_counts(stage)?);
-        let cumulative_after = sum(self.cumulative_counts(stage)?);
-        let cause = sum(self.cause_counts(stage)?);
-        let incoming = self.incoming_counts(stage).map_or(0, sum);
-        let calibration_local = sum(self.calibration_counts(stage, CalibrationPopulation::Local)?);
-        let calibration_cumulative_after =
-            sum(self.calibration_counts(stage, CalibrationPopulation::CumulativeAfter)?);
-        let calibration_previous_cumulative =
-            sum(self.calibration_counts(stage, CalibrationPopulation::PreviousCumulative)?);
-        let online = sum(self.online_counts(stage)?);
-
+        let calibration = |population| self.calibration_counts(stage, population).map(sum);
         Some(SampleCounts {
-            local,
-            cumulative_after,
-            cause,
-            incoming,
-            calibration_local,
-            calibration_cumulative_after,
-            calibration_previous_cumulative,
-            online,
-        })
-    }
-
-    /// Returns coarse score-path input availability for `stage`.
-    pub fn score_availability(&self, stage: StageId) -> Option<ScoreAvailability> {
-        let samples = self.sample_counts(stage)?;
-        Some(ScoreAvailability {
-            matrix_derived: samples.cause > 0 && samples.incoming > 0,
-            calibrated_online: self.calibration_state == CalibrationState::Frozen
-                && samples.online > 0,
+            local: sum(self.local_counts(stage)?),
+            cumulative_after: sum(self.cumulative_counts(stage)?),
+            cause: sum(self.cause_counts(stage)?),
+            incoming: self.incoming_counts(stage).map_or(0, sum),
+            calibration_local: calibration(CalibrationPopulation::Local)?,
+            calibration_cumulative_after: calibration(CalibrationPopulation::CumulativeAfter)?,
+            calibration_previous_cumulative: calibration(
+                CalibrationPopulation::PreviousCumulative,
+            )?,
+            online: sum(self.online_counts(stage)?),
         })
     }
 
@@ -463,17 +305,15 @@ impl Snapshot {
         }
     }
 
-    /// Purely subtracts `earlier` from this later snapshot.
+    /// Purely subtracts `earlier` from this later snapshot and returns the
+    /// window between them.
     ///
     /// When exactly one endpoint observed the frozen state, the window spans
-    /// the calibration freeze: its online counters cover only contexts started
-    /// after the freeze, and online diagnosis of the window is rejected.
-    pub fn delta(&self, earlier: &Self) -> Result<DeltaSnapshot, DeltaError> {
+    /// the calibration freeze; see [`Snapshot::spans_freeze`].
+    pub fn delta(&self, earlier: &Self) -> Result<Self, DeltaError> {
         if self.cookie != earlier.cookie {
             return Err(DeltaError::RegistryMismatch);
         }
-        let spans_freeze = (self.calibration_state == CalibrationState::Frozen)
-            != (earlier.calibration_state == CalibrationState::Frozen);
         let counters = self
             .counters
             .iter()
@@ -488,28 +328,21 @@ impl Snapshot {
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
-        let snapshot = Snapshot {
+        let frozen = |snapshot: &Self| snapshot.calibration_state == CalibrationState::Frozen;
+        Ok(Self {
             cookie: self.cookie,
             stages: self.stages.clone(),
             layout: self.layout,
             counters,
-            bucket_bounds: self.bucket_bounds.clone(),
-            calibration_bucket_bounds: self.calibration_bucket_bounds.clone(),
             tail_quantile: self.tail_quantile,
             calibration_state: self.calibration_state,
             calibration_report: self.calibration_report.clone(),
-            memory_budget_bytes: self.memory_budget_bytes,
             memory_estimate: self.memory_estimate,
-            consistency: Consistency::Relaxed,
-        };
-
-        Ok(DeltaSnapshot {
-            snapshot,
-            spans_freeze,
+            spans_freeze: frozen(self) != frozen(earlier),
         })
     }
 
-    fn stage_index(&self, stage: StageId) -> Option<usize> {
+    pub(crate) fn stage_index(&self, stage: StageId) -> Option<usize> {
         (stage.cookie() == self.cookie && stage.index() < self.stages.len()).then(|| stage.index())
     }
 
@@ -531,128 +364,6 @@ impl Snapshot {
         let stage = self.stage_index(stage)?;
         let start = start(self.layout, stage)?;
         self.counters.get(start..start + MATRIX_CELLS)
-    }
-}
-
-/// Owned counter differences for a window between two relaxed snapshots.
-///
-#[derive(Clone, Debug)]
-pub struct DeltaSnapshot {
-    snapshot: Snapshot,
-    spans_freeze: bool,
-}
-
-impl DeltaSnapshot {
-    /// Returns the explicitly weak consistency guarantee for this window.
-    pub const fn consistency(&self) -> Consistency {
-        self.snapshot.consistency()
-    }
-
-    /// Returns whether exactly one endpoint observed the frozen state.
-    pub const fn spans_freeze(&self) -> bool {
-        self.spans_freeze
-    }
-
-    /// Returns owned metadata for all stages in registration order.
-    pub fn stages(&self) -> &[StageMetadata] {
-        self.snapshot.stages()
-    }
-
-    /// Returns the registered name when `stage` belongs to this window.
-    pub fn stage_name(&self, stage: StageId) -> Option<&str> {
-        self.snapshot.stage_name(stage)
-    }
-
-    /// Returns the pinned ordinary bucket bounds; each bound starts the next bucket.
-    pub fn bucket_bounds(&self) -> &[u64] {
-        self.snapshot.bucket_bounds()
-    }
-
-    /// Returns the pinned calibration-grid bounds, using the same convention.
-    pub fn calibration_bucket_bounds(&self) -> &[u64] {
-        self.snapshot.calibration_bucket_bounds()
-    }
-
-    /// Returns the configured calibration tail quantile.
-    pub const fn tail_quantile(&self) -> f64 {
-        self.snapshot.tail_quantile()
-    }
-
-    /// Returns the calibration state observed at the later endpoint.
-    pub const fn calibration_state(&self) -> CalibrationState {
-        self.snapshot.calibration_state()
-    }
-
-    /// Returns the successful freeze report observed at the later endpoint.
-    pub const fn calibration_report(&self) -> Option<&FreezeReport> {
-        self.snapshot.calibration_report()
-    }
-
-    /// Returns the recorder's configured memory budget.
-    pub const fn memory_budget_bytes(&self) -> usize {
-        self.snapshot.memory_budget_bytes()
-    }
-
-    /// Returns the recorder's itemized owned-memory estimate.
-    pub const fn memory_estimate(&self) -> MemoryEstimate {
-        self.snapshot.memory_estimate()
-    }
-
-    /// Returns the local-latency distribution delta for `stage`.
-    pub fn local_counts(&self, stage: StageId) -> Option<&[u64]> {
-        self.snapshot.local_counts(stage)
-    }
-
-    /// Returns the cumulative-after distribution delta for `stage`.
-    pub fn cumulative_counts(&self, stage: StageId) -> Option<&[u64]> {
-        self.snapshot.cumulative_counts(stage)
-    }
-
-    /// Returns the destination-indexed cause-matrix delta in row-major order.
-    pub fn cause_counts(&self, destination: StageId) -> Option<&[u64]> {
-        self.snapshot.cause_counts(destination)
-    }
-
-    /// Returns the destination-indexed incoming-matrix delta in row-major order.
-    pub fn incoming_counts(&self, destination: StageId) -> Option<&[u64]> {
-        self.snapshot.incoming_counts(destination)
-    }
-
-    /// Returns a calibration-distribution delta for `stage`.
-    pub fn calibration_counts(
-        &self,
-        stage: StageId,
-        population: CalibrationPopulation,
-    ) -> Option<&[u64]> {
-        self.snapshot.calibration_counts(stage, population)
-    }
-
-    pub(crate) fn online_counts(&self, stage: StageId) -> Option<&[u64]> {
-        self.snapshot.online_counts(stage)
-    }
-
-    /// Returns totals for every stored sample population in this window.
-    pub fn sample_counts(&self, stage: StageId) -> Option<SampleCounts> {
-        self.snapshot.sample_counts(stage)
-    }
-
-    /// Returns coarse score-path input availability for this window.
-    pub fn score_availability(&self, stage: StageId) -> Option<ScoreAvailability> {
-        let mut availability = self.snapshot.score_availability(stage)?;
-        if self.spans_freeze {
-            availability.calibrated_online = false;
-        }
-        Some(availability)
-    }
-
-    /// Returns terminal completion deltas for `stage`.
-    pub fn completion_counts(&self, stage: StageId) -> Option<CompletionCounts> {
-        self.snapshot.completion_counts(stage)
-    }
-
-    /// Returns all anomaly and rejection counter deltas.
-    pub fn diagnostics(&self) -> Diagnostics {
-        self.snapshot.diagnostics()
     }
 }
 
@@ -694,14 +405,11 @@ impl Tracegrams {
             stages,
             layout: self.inner.layout,
             counters,
-            bucket_bounds: self.inner.default_bounds.clone(),
-            calibration_bucket_bounds: self.inner.calibration_bounds.clone(),
             tail_quantile: self.inner.tail_quantile,
             calibration_state,
             calibration_report,
-            memory_budget_bytes: self.inner.memory_budget_bytes,
             memory_estimate: self.inner.memory_estimate,
-            consistency: Consistency::Relaxed,
+            spans_freeze: false,
         }
     }
 }
@@ -710,16 +418,11 @@ impl Tracegrams {
 mod tests {
     use super::*;
 
-    fn two_stage_recorder() -> (Tracegrams, StageId, StageId) {
-        let mut builder = Tracegrams::builder();
-        let first = builder.stage("first").unwrap();
-        let second = builder.stage("second").unwrap();
-        (builder.build().unwrap(), first, second)
-    }
-
     #[test]
     fn every_diagnostic_counter_is_snapshot_visible() {
-        let (tracegrams, _, _) = two_stage_recorder();
+        let mut builder = Tracegrams::builder();
+        builder.stage("first").unwrap();
+        let tracegrams = builder.build().unwrap();
         let diagnostics = [
             DiagnosticCounter::InvalidStageMarks,
             DiagnosticCounter::InvalidContextMarks,
@@ -736,17 +439,19 @@ mod tests {
         }
 
         let observed = tracegrams.snapshot_relaxed().diagnostics();
-        assert_eq!(observed.invalid_stage_marks(), 1);
-        assert_eq!(observed.invalid_context_marks(), 2);
-        assert_eq!(observed.non_monotonic_marks(), 3);
-        assert_eq!(observed.clock_regressions(), 4);
-        assert_eq!(observed.latency_overflows(), 5);
-        assert_eq!(observed.cumulative_overflows(), 6);
-        assert_eq!(observed.calibration_samples_skipped_while_freezing(), 7);
-        assert_eq!(
-            observed.online_samples_skipped_missing_previous_threshold(),
-            8
-        );
         assert_eq!(observed.total(), 36);
+        assert_eq!(
+            observed,
+            Diagnostics {
+                invalid_stage_marks: 1,
+                invalid_context_marks: 2,
+                non_monotonic_marks: 3,
+                clock_regressions: 4,
+                latency_overflows: 5,
+                cumulative_overflows: 6,
+                calibration_samples_skipped_while_freezing: 7,
+                online_samples_skipped_missing_previous_threshold: 8,
+            }
+        );
     }
 }

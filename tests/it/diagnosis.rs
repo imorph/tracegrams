@@ -3,9 +3,16 @@
 use std::time::Duration;
 
 use tracegrams::{
-    Classification, DiagnoseConfig, DiagnoseError, FreezeCriteria, Outcome, Score, ScorePath,
-    ScorePopulation, ScoreStatus, Tracegrams,
+    CalibratedOnlineScores, Classification, DiagnoseConfig, DiagnoseError, Outcome, Score,
+    ScoreStatus, Snapshot, StageId, Tracegrams,
 };
+
+fn online_scores(snapshot: &Snapshot, stage: StageId) -> CalibratedOnlineScores {
+    *snapshot
+        .diagnose(stage, &DiagnoseConfig::experimental_defaults())
+        .unwrap()
+        .calibrated_online()
+}
 
 #[allow(clippy::cast_precision_loss)]
 fn assert_score(score: Score, numerator: u128, denominator: u128) {
@@ -54,29 +61,22 @@ fn matrix_scores_match_the_predecessor_only_poc_fixture() {
         .snapshot_relaxed()
         .matrix_scores(destination)
         .unwrap();
+    assert_eq!(scores.cause_samples, 100);
+    assert_eq!(scores.incoming_samples, 100);
+    let local_threshold = scores.thresholds.local.unwrap();
+    assert_eq!(local_threshold.bucket, 32);
+    assert_eq!(local_threshold.rank, 92);
+    assert_eq!(local_threshold.samples, 100);
+    assert_eq!(scores.thresholds.previous_cumulative.unwrap().bucket, 32);
+    assert_eq!(scores.thresholds.cumulative_after.unwrap().bucket, 32);
 
-    assert_eq!(scores.path(), ScorePath::MatrixDerived);
-    assert!(scores.path().known_drift());
-    assert_eq!(scores.population(), ScorePopulation::PredecessorOnly);
-    assert_eq!(scores.cause_samples(), 100);
-    assert_eq!(scores.incoming_samples(), 100);
-    let local_threshold = scores.thresholds().local().unwrap();
-    assert_eq!(local_threshold.bucket(), 32);
-    assert_eq!(local_threshold.rank(), 92);
-    assert_eq!(local_threshold.samples(), 100);
-    assert_eq!(
-        scores.thresholds().previous_cumulative().unwrap().bucket(),
-        32
-    );
-    assert_eq!(scores.thresholds().cumulative_after().unwrap().bucket(), 32);
-
-    assert_score(scores.local_tail_origin_clean(), 10, 15);
-    assert_score(scores.local_tail_origin_tail(), 5, 15);
-    assert_score(scores.local_tail_rate_given_prev_tail(), 5, 10);
-    assert_score(scores.local_tail_rate_given_prev_not_tail(), 10, 90);
-    assert_score(scores.amplification_lift(), 450, 100);
-    assert_score(scores.carry_through(), 5, 10);
-    assert_score(scores.tail_onset(), 10, 20);
+    assert_score(scores.scores.local_tail_origin_clean, 10, 15);
+    assert_score(scores.scores.local_tail_origin_tail, 5, 15);
+    assert_score(scores.scores.local_tail_rate_given_prev_tail, 5, 10);
+    assert_score(scores.scores.local_tail_rate_given_prev_not_tail, 10, 90);
+    assert_score(scores.scores.amplification_lift, 450, 100);
+    assert_score(scores.scores.carry_through, 5, 10);
+    assert_score(scores.scores.tail_onset, 10, 20);
 }
 
 #[test]
@@ -93,21 +93,20 @@ fn first_only_stage_has_no_invented_matrix_scores() {
     );
 
     let scores = tracegrams.snapshot_relaxed().matrix_scores(first).unwrap();
-    assert_eq!(scores.population(), ScorePopulation::PredecessorOnly);
-    assert_eq!(scores.cause_samples(), 0);
-    assert_eq!(scores.incoming_samples(), 0);
-    assert_eq!(scores.thresholds().local(), None);
-    assert_eq!(scores.thresholds().previous_cumulative(), None);
-    assert_eq!(scores.thresholds().cumulative_after(), None);
+    assert_eq!(scores.cause_samples, 0);
+    assert_eq!(scores.incoming_samples, 0);
+    assert_eq!(scores.thresholds.local, None);
+    assert_eq!(scores.thresholds.previous_cumulative, None);
+    assert_eq!(scores.thresholds.cumulative_after, None);
 
     for score in [
-        scores.local_tail_origin_clean(),
-        scores.local_tail_origin_tail(),
-        scores.local_tail_rate_given_prev_tail(),
-        scores.local_tail_rate_given_prev_not_tail(),
-        scores.amplification_lift(),
-        scores.carry_through(),
-        scores.tail_onset(),
+        scores.scores.local_tail_origin_clean,
+        scores.scores.local_tail_origin_tail,
+        scores.scores.local_tail_rate_given_prev_tail,
+        scores.scores.local_tail_rate_given_prev_not_tail,
+        scores.scores.amplification_lift,
+        scores.scores.carry_through,
+        scores.scores.tail_onset,
     ] {
         assert_eq!(score.status(), ScoreStatus::NoPredecessorPopulation);
         assert_eq!(score.value(), None);
@@ -144,15 +143,13 @@ fn mixed_stage_matrix_scores_stay_predecessor_only() {
     }
     let mixed_snapshot = tracegrams.snapshot_relaxed();
     let mixed = mixed_snapshot.matrix_scores(destination).unwrap();
-
-    assert_eq!(mixed.population(), ScorePopulation::PredecessorOnly);
     assert_eq!(mixed, predecessor_only);
     assert_eq!(
-        mixed_snapshot.sample_counts(destination).unwrap().local(),
+        mixed_snapshot.sample_counts(destination).unwrap().local,
         101
     );
-    assert_eq!(mixed.cause_samples(), 1);
-    assert_eq!(mixed.incoming_samples(), 1);
+    assert_eq!(mixed.cause_samples, 1);
+    assert_eq!(mixed.incoming_samples, 1);
 }
 
 #[test]
@@ -176,16 +173,16 @@ fn skipped_paths_score_the_destination_stage() {
     let skipped_scores = snapshot.matrix_scores(skipped).unwrap();
     let destination_scores = snapshot.matrix_scores(destination).unwrap();
 
-    assert_eq!(skipped_scores.cause_samples(), 0);
+    assert_eq!(skipped_scores.cause_samples, 0);
     assert_eq!(
-        skipped_scores.tail_onset().status(),
+        skipped_scores.scores.tail_onset.status(),
         ScoreStatus::NoPredecessorPopulation
     );
-    assert_eq!(destination_scores.stage(), destination);
-    assert_eq!(destination_scores.cause_samples(), 1);
-    assert_eq!(destination_scores.incoming_samples(), 1);
+    assert_eq!(destination_scores.stage, destination);
+    assert_eq!(destination_scores.cause_samples, 1);
+    assert_eq!(destination_scores.incoming_samples, 1);
     assert_eq!(
-        destination_scores.local_tail_origin_tail().status(),
+        destination_scores.scores.local_tail_origin_tail.status(),
         ScoreStatus::Available
     );
 }
@@ -210,13 +207,13 @@ fn zero_denominator_is_explicitly_unavailable() {
         .snapshot_relaxed()
         .matrix_scores(destination)
         .unwrap();
-    let clean_rate = scores.local_tail_rate_given_prev_not_tail();
+    let clean_rate = scores.scores.local_tail_rate_given_prev_not_tail;
     assert_eq!(clean_rate.status(), ScoreStatus::ZeroDenominator);
     assert_eq!(clean_rate.numerator(), 0);
     assert_eq!(clean_rate.denominator(), 0);
     assert_eq!(clean_rate.value(), None);
     assert_eq!(
-        scores.amplification_lift().status(),
+        scores.scores.amplification_lift.status(),
         ScoreStatus::ZeroDenominator
     );
 }
@@ -275,9 +272,7 @@ fn frozen_online_truth_cells_produce_the_exact_calibrated_formulas() {
     let mut context = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
     tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(200));
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
 
     for local_ns in [100, 1_000] {
         tracegrams.record_elapsed(
@@ -293,21 +288,18 @@ fn frozen_online_truth_cells_produce_the_exact_calibrated_formulas() {
     }
 
     let snapshot = tracegrams.snapshot_relaxed();
-    let scores = snapshot.calibrated_online_scores(destination).unwrap();
-    assert_eq!(scores.path(), ScorePath::CalibratedOnline);
-    assert!(!scores.path().known_drift());
-    assert_eq!(scores.population(), ScorePopulation::AllReachedMarks);
+    let scores = online_scores(&snapshot, destination);
     assert_eq!(scores.samples(), 6);
-    assert_eq!(scores.first_samples(), 2);
-    assert_eq!(scores.predecessor_samples(), 4);
-    assert_eq!(scores.thresholds().previous_cumulative_ns(), Some(104));
-    assert_online_score(scores.tail_onset(), 2, 4);
-    assert_online_score(scores.local_tail_origin_clean(), 2, 3);
-    assert_online_score(scores.local_tail_origin_tail(), 1, 3);
-    assert_online_score(scores.local_tail_rate_given_prev_tail(), 1, 2);
-    assert_online_score(scores.local_tail_rate_given_prev_not_tail(), 1, 2);
-    assert_online_score(scores.amplification_lift(), 2, 2);
-    assert_online_score(scores.carry_through(), 1, 2);
+    assert_eq!(scores.first_samples, 2);
+    assert_eq!(scores.predecessor_samples, 4);
+    assert_eq!(scores.thresholds.previous_cumulative_ns, Some(104));
+    assert_online_score(scores.scores.tail_onset, 2, 4);
+    assert_online_score(scores.scores.local_tail_origin_clean, 2, 3);
+    assert_online_score(scores.scores.local_tail_origin_tail, 1, 3);
+    assert_online_score(scores.scores.local_tail_rate_given_prev_tail, 1, 2);
+    assert_online_score(scores.scores.local_tail_rate_given_prev_not_tail, 1, 2);
+    assert_online_score(scores.scores.amplification_lift, 2, 2);
+    assert_online_score(scores.scores.carry_through, 1, 2);
 }
 
 #[test]
@@ -320,9 +312,7 @@ fn first_marks_affect_only_clean_origin_and_onset_populations() {
         only,
         Duration::from_nanos(100),
     );
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         only,
@@ -330,15 +320,15 @@ fn first_marks_affect_only_clean_origin_and_onset_populations() {
     );
 
     let snapshot = tracegrams.snapshot_relaxed();
-    let scores = snapshot.calibrated_online_scores(only).unwrap();
-    assert_online_score(scores.tail_onset(), 1, 1);
-    assert_online_score(scores.local_tail_origin_clean(), 1, 1);
+    let scores = online_scores(&snapshot, only);
+    assert_online_score(scores.scores.tail_onset, 1, 1);
+    assert_online_score(scores.scores.local_tail_origin_clean, 1, 1);
     for score in [
-        scores.local_tail_origin_tail(),
-        scores.local_tail_rate_given_prev_tail(),
-        scores.local_tail_rate_given_prev_not_tail(),
-        scores.amplification_lift(),
-        scores.carry_through(),
+        scores.scores.local_tail_origin_tail,
+        scores.scores.local_tail_rate_given_prev_tail,
+        scores.scores.local_tail_rate_given_prev_not_tail,
+        scores.scores.amplification_lift,
+        scores.scores.carry_through,
     ] {
         assert_eq!(score.status(), ScoreStatus::NoPredecessorPopulation);
         assert_eq!(score.value(), None);
@@ -361,14 +351,12 @@ fn pre_freeze_context_never_writes_online_counters() {
         stage,
         Duration::from_nanos(100),
     );
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
 
     tracegrams.record_elapsed(&mut old_context, stage, Duration::from_micros(1));
     let after_old = tracegrams.snapshot_relaxed();
-    assert_eq!(after_old.sample_counts(stage).unwrap().local(), 2);
-    assert_eq!(after_old.sample_counts(stage).unwrap().online(), 0);
+    assert_eq!(after_old.sample_counts(stage).unwrap().local, 2);
+    assert_eq!(after_old.sample_counts(stage).unwrap().online, 0);
 
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
@@ -380,7 +368,7 @@ fn pre_freeze_context_never_writes_online_counters() {
             .snapshot_relaxed()
             .sample_counts(stage)
             .unwrap()
-            .online(),
+            .online,
         1
     );
 }
@@ -391,14 +379,23 @@ fn predecessor_after_first_only_freeze_skips_the_whole_online_sample() {
     let first = builder.stage("first").unwrap();
     let destination = builder.stage("destination").unwrap();
     let tracegrams = builder.build().unwrap();
-    tracegrams.record_elapsed(
-        &mut tracegrams.start_manual(),
-        destination,
-        Duration::from_nanos(200),
+    // First marks only: the destination freezes without a previous threshold.
+    for stage in [first, destination] {
+        tracegrams.record_elapsed(
+            &mut tracegrams.start_manual(),
+            stage,
+            Duration::from_nanos(200),
+        );
+    }
+    let report = tracegrams.try_freeze_calibration(1).unwrap();
+    assert_eq!(
+        report
+            .stage(destination)
+            .unwrap()
+            .previous_cumulative
+            .estimate,
+        None
     );
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::for_stages(&[destination], 1))
-        .unwrap();
 
     let before = tracegrams.snapshot_relaxed();
     let mut context = tracegrams.start_manual();
@@ -406,21 +403,15 @@ fn predecessor_after_first_only_freeze_skips_the_whole_online_sample() {
     tracegrams.record_elapsed(&mut context, destination, Duration::from_micros(1));
     let after = tracegrams.snapshot_relaxed();
 
-    assert_eq!(after.sample_counts(destination).unwrap().online(), 0);
-    assert_eq!(after.sample_counts(destination).unwrap().cause(), 1);
-    assert_eq!(
-        after
-            .diagnose(first, &DiagnoseConfig::experimental_defaults())
-            .unwrap_err(),
-        DiagnoseError::NotCalibrated { stage: first }
-    );
+    assert_eq!(after.sample_counts(destination).unwrap().online, 0);
+    assert_eq!(after.sample_counts(destination).unwrap().cause, 1);
     assert_eq!(
         after
             .diagnostics()
-            .online_samples_skipped_missing_previous_threshold(),
+            .online_samples_skipped_missing_previous_threshold,
         before
             .diagnostics()
-            .online_samples_skipped_missing_previous_threshold()
+            .online_samples_skipped_missing_previous_threshold
             + 1
     );
 }
@@ -435,15 +426,13 @@ fn frozen_online_zero_denominators_are_explicit() {
         stage,
         Duration::from_nanos(100),
     );
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
 
-    let scores = tracegrams
-        .snapshot_relaxed()
-        .calibrated_online_scores(stage)
-        .unwrap();
-    for score in [scores.tail_onset(), scores.local_tail_origin_clean()] {
+    let scores = online_scores(&tracegrams.snapshot_relaxed(), stage);
+    for score in [
+        scores.scores.tail_onset,
+        scores.scores.local_tail_origin_clean,
+    ] {
         assert_eq!(score.status(), ScoreStatus::ZeroDenominator);
         assert_eq!(score.numerator(), 0);
         assert_eq!(score.denominator(), 0);
@@ -474,9 +463,16 @@ fn diagnosis_requires_calibration_and_classifies_from_numeric_scores() {
     let mut context = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
     tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(200));
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
+    let mut foreign_builder = Tracegrams::builder();
+    let foreign = foreign_builder.stage("foreign").unwrap();
+    assert_eq!(
+        tracegrams
+            .snapshot_relaxed()
+            .diagnose(foreign, &DiagnoseConfig::experimental_defaults())
+            .unwrap_err(),
+        DiagnoseError::ForeignStage { stage: foreign }
+    );
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
         destination,
@@ -569,7 +565,10 @@ fn classification_prefers_onset_then_amplifier_then_carry_through() {
         amplification_lift_threshold: 4.0,
         carry_through_threshold: 0.5,
     };
-    assert_eq!(scores.classification(&all_pass), Classification::Onset);
+    assert_eq!(
+        scores.scores.classification(&all_pass),
+        Classification::Onset
+    );
 
     let amplifier_and_carry_pass = DiagnoseConfig {
         onset_threshold: 0.6,
@@ -577,7 +576,7 @@ fn classification_prefers_onset_then_amplifier_then_carry_through() {
         carry_through_threshold: 0.5,
     };
     assert_eq!(
-        scores.classification(&amplifier_and_carry_pass),
+        scores.scores.classification(&amplifier_and_carry_pass),
         Classification::Amplifier
     );
 }
@@ -592,9 +591,7 @@ fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
         stage,
         Duration::from_nanos(100),
     );
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
     let before = tracegrams.snapshot_relaxed();
     tracegrams.record_elapsed(
         &mut tracegrams.start_manual(),
@@ -609,20 +606,15 @@ fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
     let window = snapshot.delta(&before).unwrap();
     let window_report = window.diagnose(stage, &config).unwrap();
     assert_eq!(first, second);
-    assert_eq!(
-        first.calibrated_online().path(),
-        ScorePath::CalibratedOnline
-    );
-    assert_eq!(first.matrix_derived().path(), ScorePath::MatrixDerived);
     assert_eq!(first.to_string(), second.to_string());
     assert_eq!(first.to_string(), window_report.to_string());
     assert_eq!(
         first.to_string(),
         concat!(
             "tracegrams diagnosis: stage\n",
+            "consistency: relaxed\n",
             "path: calibrated-online\n",
             "  population: all-reached marks (first=1, predecessor=0)\n",
-            "  consistency: relaxed\n",
             "  thresholds_ns: local=104, previous_cumulative=n/a, cumulative_after=104\n",
             "  tail_onset: 1/1 = 1.000000\n",
             "  local_tail_origin_clean: 1/1 = 1.000000\n",
@@ -633,7 +625,6 @@ fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
             "  carry_through: 0/0 = n/a (no predecessor population)\n",
             "path: matrix-derived (known drift)\n",
             "  population: predecessor-only (cause=0, incoming=0)\n",
-            "  consistency: relaxed\n",
             "  threshold_buckets: local=n/a, previous_cumulative=n/a, cumulative_after=n/a\n",
             "  tail_onset: 0/0 = n/a (no predecessor population)\n",
             "  local_tail_origin_clean: 0/0 = n/a (no predecessor population)\n",
@@ -660,26 +651,22 @@ fn cross_freeze_delta_keeps_matrix_scores_but_disables_online_diagnosis() {
     let mut context = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
     tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(200));
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
     let mut context = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
     tracegrams.record_elapsed(&mut context, destination, Duration::from_micros(1));
     let delta = tracegrams.snapshot_relaxed().delta(&earlier).unwrap();
 
     let matrix_scores = delta.matrix_scores(destination).unwrap();
-    assert_eq!(matrix_scores.cause_samples(), 2);
+    assert_eq!(matrix_scores.cause_samples, 2);
     assert_eq!(
-        matrix_scores.classification(&DiagnoseConfig::experimental_defaults()),
+        matrix_scores
+            .scores
+            .classification(&DiagnoseConfig::experimental_defaults()),
         Classification::Inconclusive
     );
     assert!(delta.spans_freeze());
-    assert_eq!(delta.sample_counts(destination).unwrap().online(), 1);
-    assert_eq!(
-        delta.calibrated_online_scores(destination).unwrap_err(),
-        DiagnoseError::WindowSpansFreeze
-    );
+    assert_eq!(delta.sample_counts(destination).unwrap().online, 1);
     assert_eq!(
         delta
             .diagnose(destination, &DiagnoseConfig::experimental_defaults())

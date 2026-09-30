@@ -5,8 +5,8 @@ use std::time::Duration;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 use tracegrams::{
-    CalibrationEstimate, CalibrationTerminal, FreezeCriteria, Outcome, Score, ScoreStatus, StageId,
-    Tracegrams,
+    CalibratedOnlineScores, CalibrationEstimate, CalibrationTerminal, DiagnoseConfig, Outcome,
+    Score, ScoreStatus, Snapshot, StageId, Tracegrams,
 };
 
 const QUANTILE: f64 = 0.5;
@@ -179,6 +179,13 @@ fn assert_online(actual: &[Score; 7], expected: &[Expected; 7]) {
     }
 }
 
+fn online_scores(snapshot: &Snapshot, stage: StageId) -> CalibratedOnlineScores {
+    *snapshot
+        .diagnose(stage, &DiagnoseConfig::experimental_defaults())
+        .unwrap()
+        .calibrated_online()
+}
+
 fn record(recorder: &Tracegrams, first: StageId, destination: StageId, event: Event) {
     let mut context = recorder.start_manual();
     if let Some(previous) = event.previous {
@@ -205,14 +212,14 @@ fn assert_reported_calibration_rank(values: &[u64], bounds: &[u64], estimate: Ca
         .filter(|value| bucket(**value, bounds) <= selected)
         .count() as u128;
 
-    assert_eq!(estimate.samples(), samples);
-    assert_eq!(estimate.rank(), rank);
+    assert_eq!(estimate.samples, samples);
+    assert_eq!(estimate.rank, rank);
     assert!(before < rank);
     assert!(through >= rank);
-    assert_eq!(estimate.terminal(), CalibrationTerminal::Finite);
-    assert_eq!(estimate.lower_bound(), Some(bounds[selected - 1]));
-    assert_eq!(estimate.upper_bound(), Some(bounds[selected]));
-    assert_eq!(bucket(estimate.value().unwrap(), bounds), selected);
+    assert_eq!(estimate.terminal, CalibrationTerminal::Finite);
+    assert_eq!(estimate.lower_bound, Some(bounds[selected - 1]));
+    assert_eq!(estimate.upper_bound, Some(bounds[selected]));
+    assert_eq!(bucket(estimate.value.unwrap(), bounds), selected);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -237,9 +244,7 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
     for event in &calibration {
         record(&recorder, first, destination, *event);
     }
-    let report = recorder
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    let report = recorder.try_freeze_calibration(1).unwrap();
     let stage_report = report.stage(destination).unwrap();
     let calibration_bounds = recorder
         .snapshot_relaxed()
@@ -251,38 +256,38 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
                 .iter()
                 .map(|event| event.local)
                 .collect::<Vec<_>>(),
-            stage_report.local().estimate().unwrap(),
+            stage_report.local.estimate.unwrap(),
         ),
         (
             calibration
                 .iter()
                 .map(|event| event.after())
                 .collect::<Vec<_>>(),
-            stage_report.cumulative_after().estimate().unwrap(),
+            stage_report.cumulative_after.estimate.unwrap(),
         ),
         (
             calibration
                 .iter()
                 .filter_map(|event| event.previous)
                 .collect::<Vec<_>>(),
-            stage_report.previous_cumulative().estimate().unwrap(),
+            stage_report.previous_cumulative.estimate.unwrap(),
         ),
     ] {
         assert_reported_calibration_rank(&values, &calibration_bounds, estimate);
     }
 
-    let local_ns = stage_report.local().estimate().unwrap().value().unwrap();
+    let local_ns = stage_report.local.estimate.unwrap().value.unwrap();
     let previous_ns = stage_report
-        .previous_cumulative()
-        .estimate()
+        .previous_cumulative
+        .estimate
         .unwrap()
-        .value()
+        .value
         .unwrap();
     let after_ns = stage_report
-        .cumulative_after()
-        .estimate()
+        .cumulative_after
+        .estimate
         .unwrap()
-        .value()
+        .value
         .unwrap();
     let mut online = scored
         .into_iter()
@@ -330,23 +335,23 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
     );
     let matrix = snapshot.matrix_scores(destination).unwrap();
     assert_eq!(
-        matrix.thresholds().previous_cumulative().unwrap().bucket(),
+        matrix.thresholds.previous_cumulative.unwrap().bucket,
         previous_bucket
     );
-    assert_eq!(matrix.thresholds().local().unwrap().bucket(), local_bucket);
+    assert_eq!(matrix.thresholds.local.unwrap().bucket, local_bucket);
     assert_eq!(
-        matrix.thresholds().cumulative_after().unwrap().bucket(),
+        matrix.thresholds.cumulative_after.unwrap().bucket,
         after_bucket
     );
     assert_matrix(
         &[
-            matrix.local_tail_origin_clean(),
-            matrix.local_tail_origin_tail(),
-            matrix.local_tail_rate_given_prev_tail(),
-            matrix.local_tail_rate_given_prev_not_tail(),
-            matrix.amplification_lift(),
-            matrix.carry_through(),
-            matrix.tail_onset(),
+            matrix.scores.local_tail_origin_clean,
+            matrix.scores.local_tail_origin_tail,
+            matrix.scores.local_tail_rate_given_prev_tail,
+            matrix.scores.local_tail_rate_given_prev_not_tail,
+            matrix.scores.amplification_lift,
+            matrix.scores.carry_through,
+            matrix.scores.tail_onset,
         ],
         &matrix_expected,
     );
@@ -358,16 +363,16 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
         |value| value >= after_ns,
         true,
     );
-    let actual = snapshot.calibrated_online_scores(destination).unwrap();
+    let actual = online_scores(&snapshot, destination);
     assert_online(
         &[
-            actual.local_tail_origin_clean(),
-            actual.local_tail_origin_tail(),
-            actual.local_tail_rate_given_prev_tail(),
-            actual.local_tail_rate_given_prev_not_tail(),
-            actual.amplification_lift(),
-            actual.carry_through(),
-            actual.tail_onset(),
+            actual.scores.local_tail_origin_clean,
+            actual.scores.local_tail_origin_tail,
+            actual.scores.local_tail_rate_given_prev_tail,
+            actual.scores.local_tail_rate_given_prev_not_tail,
+            actual.scores.amplification_lift,
+            actual.scores.carry_through,
+            actual.scores.tail_onset,
         ],
         &online_expected,
     );
@@ -416,9 +421,7 @@ fn first_only_populations_have_path_specific_statuses() {
     for event in calibration {
         record(&recorder, destination, destination, event);
     }
-    recorder
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    recorder.try_freeze_calibration(1).unwrap();
     let online = [
         Event {
             previous: None,
@@ -437,13 +440,13 @@ fn first_only_populations_have_path_specific_statuses() {
     let matrix = snapshot.matrix_scores(destination).unwrap();
     assert_matrix(
         &[
-            matrix.local_tail_origin_clean(),
-            matrix.local_tail_origin_tail(),
-            matrix.local_tail_rate_given_prev_tail(),
-            matrix.local_tail_rate_given_prev_not_tail(),
-            matrix.amplification_lift(),
-            matrix.carry_through(),
-            matrix.tail_onset(),
+            matrix.scores.local_tail_origin_clean,
+            matrix.scores.local_tail_origin_tail,
+            matrix.scores.local_tail_rate_given_prev_tail,
+            matrix.scores.local_tail_rate_given_prev_not_tail,
+            matrix.scores.amplification_lift,
+            matrix.scores.carry_through,
+            matrix.scores.tail_onset,
         ],
         &[no_predecessor(); 7],
     );
@@ -453,28 +456,20 @@ fn first_only_populations_have_path_specific_statuses() {
     let expected = expected_scores(
         &online,
         |_| false,
-        |value| value >= stage.local().estimate().unwrap().value().unwrap(),
-        |value| {
-            value
-                >= stage
-                    .cumulative_after()
-                    .estimate()
-                    .unwrap()
-                    .value()
-                    .unwrap()
-        },
+        |value| value >= stage.local.estimate.unwrap().value.unwrap(),
+        |value| value >= stage.cumulative_after.estimate.unwrap().value.unwrap(),
         true,
     );
-    let actual = snapshot.calibrated_online_scores(destination).unwrap();
+    let actual = online_scores(&snapshot, destination);
     assert_online(
         &[
-            actual.local_tail_origin_clean(),
-            actual.local_tail_origin_tail(),
-            actual.local_tail_rate_given_prev_tail(),
-            actual.local_tail_rate_given_prev_not_tail(),
-            actual.amplification_lift(),
-            actual.carry_through(),
-            actual.tail_onset(),
+            actual.scores.local_tail_origin_clean,
+            actual.scores.local_tail_origin_tail,
+            actual.scores.local_tail_rate_given_prev_tail,
+            actual.scores.local_tail_rate_given_prev_not_tail,
+            actual.scores.amplification_lift,
+            actual.scores.carry_through,
+            actual.scores.tail_onset,
         ],
         &expected,
     );
@@ -504,17 +499,10 @@ fn amplification_lift_reports_zero_denominator() {
     ] {
         record(&recorder, first, destination, event);
     }
-    let report = recorder
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    let report = recorder.try_freeze_calibration(1).unwrap();
     let stage = report.stage(destination).unwrap();
-    let previous = stage
-        .previous_cumulative()
-        .estimate()
-        .unwrap()
-        .value()
-        .unwrap();
-    let local = stage.local().estimate().unwrap().value().unwrap();
+    let previous = stage.previous_cumulative.estimate.unwrap().value.unwrap();
+    let local = stage.local.estimate.unwrap().value.unwrap();
     record(
         &recorder,
         first,
@@ -525,11 +513,9 @@ fn amplification_lift_reports_zero_denominator() {
         },
     );
     assert_eq!(
-        recorder
-            .snapshot_relaxed()
-            .calibrated_online_scores(destination)
-            .unwrap()
-            .amplification_lift()
+        online_scores(&recorder.snapshot_relaxed(), destination)
+            .scores
+            .amplification_lift
             .status(),
         ScoreStatus::ZeroDenominator
     );

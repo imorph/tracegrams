@@ -1,242 +1,16 @@
-//! Bounded streaming calibration readiness and explicit freeze control.
+//! Bounded streaming calibration and explicit freeze control.
 
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::Ordering;
 
-use crate::bucket::{QuantileEstimate, TerminalStatus, estimate_quantile};
+use crate::bucket::{
+    CalibrationEstimate, CalibrationTerminal, calibration_bounds, estimate_quantile,
+};
 use crate::init::{StageId, Tracegrams};
 use crate::recorder::{
-    CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationDistribution,
+    CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationPopulation,
 };
-
-/// Readiness of one calibration population.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum PopulationReadiness {
-    /// The population has enough samples to derive a threshold.
-    Ready {
-        /// Samples observed by the relaxed scan.
-        samples: u128,
-        /// Required minimum sample count.
-        minimum: u64,
-    },
-    /// The population has not reached its required minimum.
-    Insufficient {
-        /// Samples observed by the relaxed scan.
-        samples: u128,
-        /// Required minimum sample count.
-        minimum: u64,
-    },
-    /// No predecessor-bearing marks have reached this stage.
-    AbsentNoPredecessor,
-}
-
-impl PopulationReadiness {
-    /// Returns the observed sample count.
-    pub const fn samples(self) -> u128 {
-        match self {
-            Self::Ready { samples, .. } | Self::Insufficient { samples, .. } => samples,
-            Self::AbsentNoPredecessor => 0,
-        }
-    }
-
-    /// Returns whether this population permits freezing.
-    pub const fn permits_freeze(self) -> bool {
-        matches!(self, Self::Ready { .. } | Self::AbsentNoPredecessor)
-    }
-}
-
-/// Per-population readiness for one stage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StageCalibrationReadiness {
-    stage: StageId,
-    local: PopulationReadiness,
-    cumulative_after: PopulationReadiness,
-    previous_cumulative: PopulationReadiness,
-}
-
-impl StageCalibrationReadiness {
-    /// Returns the stage described by this entry.
-    pub const fn stage(self) -> StageId {
-        self.stage
-    }
-
-    /// Returns local-latency readiness.
-    pub const fn local(self) -> PopulationReadiness {
-        self.local
-    }
-
-    /// Returns cumulative-after readiness.
-    pub const fn cumulative_after(self) -> PopulationReadiness {
-        self.cumulative_after
-    }
-
-    /// Returns previous-cumulative readiness.
-    pub const fn previous_cumulative(self) -> PopulationReadiness {
-        self.previous_cumulative
-    }
-
-    /// Returns whether every required or observed population permits freezing.
-    pub const fn is_ready(self) -> bool {
-        self.local.permits_freeze()
-            && self.cumulative_after.permits_freeze()
-            && self.previous_cumulative.permits_freeze()
-    }
-}
-
-/// Owned relaxed readiness scan for selected stages.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CalibrationReadiness {
-    minimum_samples: u64,
-    stages: Box<[StageCalibrationReadiness]>,
-}
-
-impl CalibrationReadiness {
-    /// Returns the requested per-population minimum.
-    pub const fn minimum_samples(&self) -> u64 {
-        self.minimum_samples
-    }
-
-    /// Returns stage entries in registration order.
-    pub fn stages(&self) -> &[StageCalibrationReadiness] {
-        &self.stages
-    }
-
-    /// Returns the entry for `stage` when it belongs to this scan.
-    pub fn stage(&self, stage: StageId) -> Option<StageCalibrationReadiness> {
-        self.stages
-            .iter()
-            .copied()
-            .find(|entry| entry.stage == stage)
-    }
-
-    /// Returns whether every selected stage permits freezing.
-    pub fn is_ready(&self) -> bool {
-        self.stages.iter().all(|stage| stage.is_ready())
-    }
-}
-
-/// Stages and minimum population size requested for an explicit freeze.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FreezeCriteria {
-    minimum_samples: u64,
-    selection: FreezeSelection,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum FreezeSelection {
-    All,
-    Selected(Box<[StageId]>),
-}
-
-impl FreezeCriteria {
-    /// Selects every registered stage.
-    ///
-    /// `minimum_samples` may be zero. Empty required populations remain not
-    /// ready, while an empty previous-cumulative population is permitted.
-    pub const fn all_stages(minimum_samples: u64) -> Self {
-        Self {
-            minimum_samples,
-            selection: FreezeSelection::All,
-        }
-    }
-
-    /// Selects only the supplied stages; excluded stages remain uncalibrated.
-    ///
-    /// `minimum_samples` may be zero. Empty required populations remain not
-    /// ready, while an empty previous-cumulative population is permitted.
-    pub fn for_stages(stages: &[StageId], minimum_samples: u64) -> Self {
-        Self {
-            minimum_samples,
-            selection: FreezeSelection::Selected(stages.into()),
-        }
-    }
-
-    /// Returns the requested per-population minimum.
-    pub const fn minimum_samples(&self) -> u64 {
-        self.minimum_samples
-    }
-}
-
-/// Terminal status of a calibration quantile estimate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum CalibrationTerminal {
-    /// The selected rank is below the finite calibration range.
-    Lower,
-    /// The selected rank has finite lower and upper bounds.
-    Finite,
-    /// The selected rank is above the finite calibration range.
-    Upper,
-}
-
-/// One nearest-rank estimate from the pinned calibration grid.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CalibrationEstimate {
-    rank: u128,
-    samples: u128,
-    lower_bound: Option<u64>,
-    upper_bound: Option<u64>,
-    value: Option<u64>,
-    max_relative_error: Option<f64>,
-    terminal: CalibrationTerminal,
-}
-
-impl CalibrationEstimate {
-    /// Returns the selected nearest rank.
-    pub const fn rank(self) -> u128 {
-        self.rank
-    }
-
-    /// Returns the scanned population size.
-    pub const fn samples(self) -> u128 {
-        self.samples
-    }
-
-    /// Returns the inclusive finite lower bound, when known.
-    pub const fn lower_bound(self) -> Option<u64> {
-        self.lower_bound
-    }
-
-    /// Returns the exclusive finite upper bound, when known.
-    pub const fn upper_bound(self) -> Option<u64> {
-        self.upper_bound
-    }
-
-    /// Returns the finite minimax threshold representative.
-    pub const fn value(self) -> Option<u64> {
-        self.value
-    }
-
-    /// Returns the finite bucket's maximum relative value error.
-    pub const fn max_relative_error(self) -> Option<f64> {
-        self.max_relative_error
-    }
-
-    /// Returns whether the selected rank is finite or terminal.
-    pub const fn terminal(self) -> CalibrationTerminal {
-        self.terminal
-    }
-}
-
-impl From<QuantileEstimate> for CalibrationEstimate {
-    fn from(estimate: QuantileEstimate) -> Self {
-        Self {
-            rank: estimate.selection.rank,
-            samples: estimate.selection.samples,
-            lower_bound: estimate.lower_bound,
-            upper_bound: estimate.upper_bound,
-            value: estimate.value,
-            max_relative_error: estimate.max_relative_error,
-            terminal: match estimate.terminal {
-                TerminalStatus::Lower => CalibrationTerminal::Lower,
-                TerminalStatus::Finite => CalibrationTerminal::Finite,
-                TerminalStatus::Upper => CalibrationTerminal::Upper,
-            },
-        }
-    }
-}
 
 /// Availability of a threshold in a freeze report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,79 +26,55 @@ pub enum CalibrationThresholdAvailability {
 
 /// Freeze information for one calibration population.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CalibrationPopulationReport {
-    population: crate::snapshot::CalibrationPopulation,
-    samples: u128,
-    availability: CalibrationThresholdAvailability,
-    estimate: Option<CalibrationEstimate>,
+    /// Represented population.
+    pub population: CalibrationPopulation,
+    /// Population size observed by the freeze scan.
+    pub samples: u128,
+    /// Nearest-rank estimate, including terminal estimates; `None` when the
+    /// previous-cumulative population is absent.
+    pub estimate: Option<CalibrationEstimate>,
 }
 
 impl CalibrationPopulationReport {
-    /// Returns the represented population.
-    pub const fn population(self) -> crate::snapshot::CalibrationPopulation {
-        self.population
-    }
-
-    /// Returns the population size observed by the freeze scan.
-    pub const fn samples(self) -> u128 {
-        self.samples
-    }
-
-    /// Returns threshold availability.
+    /// Returns threshold availability derived from the estimate.
     pub const fn availability(self) -> CalibrationThresholdAvailability {
-        self.availability
-    }
-
-    /// Returns the nearest-rank estimate, including terminal estimates.
-    pub const fn estimate(self) -> Option<CalibrationEstimate> {
-        self.estimate
+        match self.estimate {
+            None => CalibrationThresholdAvailability::AbsentNoPredecessor,
+            Some(CalibrationEstimate {
+                terminal: CalibrationTerminal::Finite,
+                ..
+            }) => CalibrationThresholdAvailability::Available,
+            Some(_) => CalibrationThresholdAvailability::RangeInsufficient,
+        }
     }
 }
 
-/// Frozen calibration information for one selected stage.
+/// Calibration information for one stage.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct StageCalibrationReport {
-    stage: StageId,
-    local: CalibrationPopulationReport,
-    cumulative_after: CalibrationPopulationReport,
-    previous_cumulative: CalibrationPopulationReport,
-}
-
-impl StageCalibrationReport {
-    /// Returns the selected stage.
-    pub const fn stage(self) -> StageId {
-        self.stage
-    }
-
-    /// Returns the local-latency threshold report.
-    pub const fn local(self) -> CalibrationPopulationReport {
-        self.local
-    }
-
-    /// Returns the cumulative-after threshold report.
-    pub const fn cumulative_after(self) -> CalibrationPopulationReport {
-        self.cumulative_after
-    }
-
-    /// Returns the previous-cumulative threshold report.
-    pub const fn previous_cumulative(self) -> CalibrationPopulationReport {
-        self.previous_cumulative
-    }
+    /// Reported stage.
+    pub stage: StageId,
+    /// Local-latency threshold report.
+    pub local: CalibrationPopulationReport,
+    /// Cumulative-after threshold report.
+    pub cumulative_after: CalibrationPopulationReport,
+    /// Previous-cumulative threshold report.
+    pub previous_cumulative: CalibrationPopulationReport,
 }
 
 /// Owned report from one relaxed freeze attempt.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct FreezeReport {
-    stages: Box<[StageCalibrationReport]>,
+    /// Stage reports in registration order.
+    pub stages: Box<[StageCalibrationReport]>,
 }
 
 impl FreezeReport {
-    /// Returns selected stage reports in registration order.
-    pub fn stages(&self) -> &[StageCalibrationReport] {
-        &self.stages
-    }
-
-    /// Returns the report for `stage` when it was selected.
+    /// Returns the report for `stage` when it belongs to this recorder.
     pub fn stage(&self, stage: StageId) -> Option<StageCalibrationReport> {
         self.stages
             .iter()
@@ -337,60 +87,50 @@ impl FreezeReport {
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum FreezeError {
-    /// A selected-stage criterion contained no stages.
-    NoStagesSelected,
-    /// A selected stage does not belong to this recorder.
-    InvalidStageSelection {
-        /// Rejected stage identifier.
-        stage: StageId,
-    },
-    /// A selected stage occurred more than once.
-    DuplicateStageSelection {
-        /// Repeated stage identifier.
-        stage: StageId,
-    },
-    /// At least one required or observed population is not ready.
+    /// A required or observed population has fewer samples than requested.
+    ///
+    /// Local and cumulative-after populations are required and must be
+    /// nonempty. An empty previous-cumulative population is permitted; a
+    /// nonempty one must reach the minimum.
     NotReady {
-        /// Relaxed readiness scan that prevented the freeze.
-        readiness: CalibrationReadiness,
+        /// First stage, in registration order, with an unready population.
+        stage: StageId,
+        /// Unready population.
+        population: CalibrationPopulation,
+        /// Samples observed by the relaxed scan.
+        samples: u128,
+        /// Requested minimum sample count.
+        minimum: u64,
     },
     /// Another caller currently owns the freeze transition.
     AlreadyFreezing,
     /// Calibration has already frozen successfully.
     AlreadyFrozen,
-    /// A selected quantile rank landed in a terminal bucket.
+    /// A quantile rank landed in a terminal bucket.
     CalibrationRangeInsufficient {
         /// Stage whose population selected a terminal bucket.
         stage: StageId,
         /// Population whose range was insufficient.
-        population: crate::snapshot::CalibrationPopulation,
+        population: CalibrationPopulation,
         /// Selected lower or upper terminal.
         terminal: CalibrationTerminal,
         /// Full retained relaxed report for the failed attempt.
         report: FreezeReport,
-    },
-    /// Calibration counters exceeded the supported nearest-rank total.
-    CalibrationArithmeticOverflow {
-        /// Stage whose population overflowed.
-        stage: StageId,
-        /// Population whose counter total overflowed.
-        population: crate::snapshot::CalibrationPopulation,
     },
 }
 
 impl fmt::Display for FreezeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoStagesSelected => formatter.write_str("freeze criteria selected no stages"),
-            Self::InvalidStageSelection { stage } => {
-                write!(formatter, "freeze criteria contains foreign {stage:?}")
-            }
-            Self::DuplicateStageSelection { stage } => {
-                write!(formatter, "freeze criteria repeats {stage:?}")
-            }
-            Self::NotReady { .. } => {
-                formatter.write_str("selected calibration populations are not ready")
-            }
+            Self::NotReady {
+                stage,
+                population,
+                samples,
+                minimum,
+            } => write!(
+                formatter,
+                "{stage:?} {population:?} has {samples} calibration samples; {minimum} required"
+            ),
             Self::AlreadyFreezing => formatter.write_str("calibration is already freezing"),
             Self::AlreadyFrozen => formatter.write_str("calibration is already frozen"),
             Self::CalibrationRangeInsufficient {
@@ -401,10 +141,6 @@ impl fmt::Display for FreezeError {
             } => write!(
                 formatter,
                 "calibration range is insufficient for {stage:?} {population:?}: {terminal:?}"
-            ),
-            Self::CalibrationArithmeticOverflow { stage, population } => write!(
-                formatter,
-                "calibration counter total overflowed for {stage:?} {population:?}"
             ),
         }
     }
@@ -444,7 +180,7 @@ impl FrozenStageCalibration {
 }
 
 struct PopulationScan {
-    population: crate::snapshot::CalibrationPopulation,
+    population: CalibrationPopulation,
     counts: Box<[u64]>,
     samples: u128,
 }
@@ -457,27 +193,17 @@ struct StageScan {
 }
 
 impl Tracegrams {
-    /// Reports calibration readiness for every registered stage.
+    /// Attempts the single explicit collecting-to-frozen transition for every
+    /// registered stage.
     ///
-    /// A zero minimum is permitted, but does not make an empty required
-    /// population ready. An empty previous-cumulative population is reported
-    /// as [`PopulationReadiness::AbsentNoPredecessor`].
-    pub fn calibration_readiness(&self, minimum_samples: u64) -> CalibrationReadiness {
-        let stages = self.stage_ids().collect::<Vec<_>>();
-        readiness_from_scans(&self.scan_calibration(&stages), minimum_samples)
-    }
-
-    /// Attempts the single explicit collecting-to-frozen transition.
-    ///
-    /// A zero minimum is permitted, but an empty required population returns
+    /// `minimum_samples` applies to each population. A zero minimum is
+    /// permitted, but an empty required population still returns
     /// [`FreezeError::NotReady`] before this call claims the freeze
     /// transition.
     pub fn try_freeze_calibration(
         &self,
-        criteria: FreezeCriteria,
+        minimum_samples: u64,
     ) -> Result<FreezeReport, FreezeError> {
-        let minimum_samples = criteria.minimum_samples;
-        let stages = self.validate_selection(criteria)?;
         match self.inner.calibration_state.load(Ordering::Acquire) {
             CALIBRATION_COLLECTING => {}
             CALIBRATION_FREEZING => return Err(FreezeError::AlreadyFreezing),
@@ -485,9 +211,8 @@ impl Tracegrams {
             _ => unreachable!("calibration state has a fixed internal representation"),
         }
 
-        let readiness = readiness_from_scans(&self.scan_calibration(&stages), minimum_samples);
-        if !readiness.is_ready() {
-            return Err(FreezeError::NotReady { readiness });
+        if let Some(error) = first_unready(&self.scan_calibration(), minimum_samples) {
+            return Err(error);
         }
 
         if let Err(observed) = self.inner.calibration_state.compare_exchange(
@@ -503,14 +228,10 @@ impl Tracegrams {
             });
         }
 
-        self.freeze_after_claim(&stages, minimum_samples)
+        self.freeze_after_claim(minimum_samples)
     }
 
-    fn freeze_after_claim(
-        &self,
-        stages: &[StageId],
-        minimum_samples: u64,
-    ) -> Result<FreezeReport, FreezeError> {
+    fn freeze_after_claim(&self, minimum_samples: u64) -> Result<FreezeReport, FreezeError> {
         // Re-scan after claiming the transition; any readiness observed
         // before the claim may be stale. Writers that observed Collecting can
         // interleave their two or three increments with this relaxed scan
@@ -519,20 +240,13 @@ impl Tracegrams {
         // promises per-cell atomicity only: thresholds are statistical
         // estimates over approximately coincident populations, not a
         // cross-cell-consistent snapshot.
-        let scans = self.scan_calibration(stages);
-        let readiness = readiness_from_scans(&scans, minimum_samples);
-        if !readiness.is_ready() {
+        let scans = self.scan_calibration();
+        if let Some(error) = first_unready(&scans, minimum_samples) {
             self.restore_collecting();
-            return Err(FreezeError::NotReady { readiness });
+            return Err(error);
         }
 
-        let stage_reports = match self.derive_stage_reports(&scans) {
-            Ok(reports) => reports,
-            Err(error) => {
-                self.restore_collecting();
-                return Err(error);
-            }
-        };
+        let stage_reports = self.derive_stage_reports(&scans);
         if let Some((stage, population, terminal)) = first_terminal(&stage_reports) {
             self.restore_collecting();
             return Err(FreezeError::CalibrationRangeInsufficient {
@@ -582,66 +296,27 @@ impl Tracegrams {
         Some(FreezeReport { stages })
     }
 
-    fn validate_selection(&self, criteria: FreezeCriteria) -> Result<Vec<StageId>, FreezeError> {
-        let mut stages = match criteria.selection {
-            FreezeSelection::All => self.stage_ids().collect(),
-            FreezeSelection::Selected(stages) => stages.into_vec(),
-        };
-        if stages.is_empty() {
-            return Err(FreezeError::NoStagesSelected);
-        }
-        for (offset, stage) in stages.iter().copied().enumerate() {
-            if stage.cookie() != self.inner.cookie
-                || stage.index() >= self.inner.layout.stage_count()
-            {
-                return Err(FreezeError::InvalidStageSelection { stage });
-            }
-            if stages[..offset].contains(&stage) {
-                return Err(FreezeError::DuplicateStageSelection { stage });
-            }
-        }
-        stages.sort_unstable_by_key(|stage| stage.index());
-        Ok(stages)
-    }
-
-    fn scan_calibration(&self, stages: &[StageId]) -> Vec<StageScan> {
-        stages
-            .iter()
-            .copied()
+    fn scan_calibration(&self) -> Vec<StageScan> {
+        self.stage_ids()
             .map(|stage| StageScan {
                 stage,
-                local: self.scan_population(
-                    stage,
-                    crate::snapshot::CalibrationPopulation::Local,
-                    CalibrationDistribution::Local,
-                ),
-                cumulative_after: self.scan_population(
-                    stage,
-                    crate::snapshot::CalibrationPopulation::CumulativeAfter,
-                    CalibrationDistribution::CumulativeAfter,
-                ),
-                previous_cumulative: self.scan_population(
-                    stage,
-                    crate::snapshot::CalibrationPopulation::PreviousCumulative,
-                    CalibrationDistribution::PreviousCumulative,
-                ),
+                local: self.scan_population(stage, CalibrationPopulation::Local),
+                cumulative_after: self
+                    .scan_population(stage, CalibrationPopulation::CumulativeAfter),
+                previous_cumulative: self
+                    .scan_population(stage, CalibrationPopulation::PreviousCumulative),
             })
             .collect()
     }
 
-    fn scan_population(
-        &self,
-        stage: StageId,
-        population: crate::snapshot::CalibrationPopulation,
-        distribution: CalibrationDistribution,
-    ) -> PopulationScan {
-        let counts = (0..=self.inner.calibration_bounds.len())
+    fn scan_population(&self, stage: StageId, population: CalibrationPopulation) -> PopulationScan {
+        let counts = (0..=calibration_bounds().len())
             .map(|bucket| {
                 let index = self
                     .inner
                     .layout
-                    .calibration(stage.index(), distribution, bucket)
-                    .expect("validated stages and pinned buckets have storage");
+                    .calibration(stage.index(), population, bucket)
+                    .expect("registered stages and pinned buckets have storage");
                 self.inner.counters[index].load(Ordering::Relaxed)
             })
             .collect::<Vec<_>>()
@@ -654,70 +329,30 @@ impl Tracegrams {
         }
     }
 
-    fn derive_stage_reports(
-        &self,
-        scans: &[StageScan],
-    ) -> Result<Vec<StageCalibrationReport>, FreezeError> {
+    fn derive_stage_reports(&self, scans: &[StageScan]) -> Vec<StageCalibrationReport> {
         scans
             .iter()
-            .map(|scan| {
-                Ok(StageCalibrationReport {
-                    stage: scan.stage,
-                    local: self.derive_population_report(scan.stage, &scan.local, false)?,
-                    cumulative_after: self.derive_population_report(
-                        scan.stage,
-                        &scan.cumulative_after,
-                        false,
-                    )?,
-                    previous_cumulative: self.derive_population_report(
-                        scan.stage,
-                        &scan.previous_cumulative,
-                        true,
-                    )?,
-                })
+            .map(|scan| StageCalibrationReport {
+                stage: scan.stage,
+                local: self.derive_population_report(&scan.local),
+                cumulative_after: self.derive_population_report(&scan.cumulative_after),
+                previous_cumulative: self.derive_population_report(&scan.previous_cumulative),
             })
             .collect()
     }
 
-    fn derive_population_report(
-        &self,
-        stage: StageId,
-        scan: &PopulationScan,
-        absent_allowed: bool,
-    ) -> Result<CalibrationPopulationReport, FreezeError> {
-        if absent_allowed && scan.samples == 0 {
-            return Ok(CalibrationPopulationReport {
-                population: scan.population,
-                samples: 0,
-                availability: CalibrationThresholdAvailability::AbsentNoPredecessor,
-                estimate: None,
-            });
-        }
-        let estimate = estimate_quantile(
-            &scan.counts,
-            &self.inner.calibration_bounds,
-            self.inner.tail_quantile,
-        )
-        .map_err(|_| FreezeError::CalibrationArithmeticOverflow {
-            stage,
-            population: scan.population,
-        })?
-        .ok_or(FreezeError::CalibrationArithmeticOverflow {
-            stage,
-            population: scan.population,
-        })?;
-        let estimate = CalibrationEstimate::from(estimate);
-        let availability = if estimate.terminal == CalibrationTerminal::Finite {
-            CalibrationThresholdAvailability::Available
-        } else {
-            CalibrationThresholdAvailability::RangeInsufficient
-        };
-        Ok(CalibrationPopulationReport {
+    /// Readiness has already rejected empty required populations, so only an
+    /// absent previous-cumulative population yields no estimate.
+    fn derive_population_report(&self, scan: &PopulationScan) -> CalibrationPopulationReport {
+        CalibrationPopulationReport {
             population: scan.population,
             samples: scan.samples,
-            availability,
-            estimate: Some(estimate),
-        })
+            estimate: estimate_quantile(
+                &scan.counts,
+                calibration_bounds(),
+                self.inner.tail_quantile,
+            ),
+        }
     }
 
     fn restore_collecting(&self) {
@@ -727,46 +362,36 @@ impl Tracegrams {
     }
 }
 
-fn readiness_from_scans(scans: &[StageScan], minimum: u64) -> CalibrationReadiness {
-    let stages = scans
-        .iter()
-        .map(|scan| StageCalibrationReadiness {
+/// Returns the first population, in registration and population order, that
+/// does not permit freezing.
+fn first_unready(scans: &[StageScan], minimum: u64) -> Option<FreezeError> {
+    let ready = |population: &PopulationScan, may_be_absent: bool| {
+        if population.samples == 0 {
+            may_be_absent
+        } else {
+            population.samples >= u128::from(minimum)
+        }
+    };
+    scans.iter().find_map(|scan| {
+        [
+            (&scan.local, false),
+            (&scan.cumulative_after, false),
+            (&scan.previous_cumulative, true),
+        ]
+        .into_iter()
+        .find(|(population, may_be_absent)| !ready(population, *may_be_absent))
+        .map(|(population, _)| FreezeError::NotReady {
             stage: scan.stage,
-            local: required_readiness(scan.local.samples, minimum),
-            cumulative_after: required_readiness(scan.cumulative_after.samples, minimum),
-            previous_cumulative: previous_readiness(scan.previous_cumulative.samples, minimum),
+            population: population.population,
+            samples: population.samples,
+            minimum,
         })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    CalibrationReadiness {
-        minimum_samples: minimum,
-        stages,
-    }
-}
-
-fn required_readiness(samples: u128, minimum: u64) -> PopulationReadiness {
-    if samples > 0 && samples >= u128::from(minimum) {
-        PopulationReadiness::Ready { samples, minimum }
-    } else {
-        PopulationReadiness::Insufficient { samples, minimum }
-    }
-}
-
-fn previous_readiness(samples: u128, minimum: u64) -> PopulationReadiness {
-    if samples == 0 {
-        PopulationReadiness::AbsentNoPredecessor
-    } else {
-        required_readiness(samples, minimum)
-    }
+    })
 }
 
 fn first_terminal(
     reports: &[StageCalibrationReport],
-) -> Option<(
-    StageId,
-    crate::snapshot::CalibrationPopulation,
-    CalibrationTerminal,
-)> {
+) -> Option<(StageId, CalibrationPopulation, CalibrationTerminal)> {
     reports.iter().find_map(|stage| {
         [
             stage.local,
@@ -793,93 +418,45 @@ mod tests {
     use crate::bucket::bucketize;
 
     #[test]
-    fn arithmetic_overflow_restores_collecting_without_publication() {
-        let mut builder = Tracegrams::builder();
-        let stage = builder.stage("stage").unwrap();
-        let tracegrams = builder.build().unwrap();
-        tracegrams.record_elapsed(
-            &mut tracegrams.start_manual(),
-            stage,
-            Duration::from_nanos(100),
-        );
-
-        for (bucket, count) in [(1, u64::MAX), (2, 1)] {
-            let index = tracegrams
-                .inner
-                .layout
-                .calibration(stage.index(), CalibrationDistribution::Local, bucket)
-                .unwrap();
-            tracegrams.inner.counters[index].store(count, Ordering::Relaxed);
-        }
-        tracegrams
-            .inner
-            .calibration_state
-            .store(CALIBRATION_FREEZING, Ordering::Release);
-
-        assert!(matches!(
-            tracegrams.freeze_after_claim(&[stage], 1),
-            Err(FreezeError::CalibrationArithmeticOverflow {
-                stage: overflow_stage,
-                population: crate::snapshot::CalibrationPopulation::Local,
-            }) if overflow_stage == stage
-        ));
-        assert!(tracegrams.frozen_calibration_report().is_none());
-        assert_eq!(
-            tracegrams.inner.calibration_state.load(Ordering::Acquire),
-            CALIBRATION_COLLECTING
-        );
-        assert!(
-            tracegrams
-                .inner
-                .frozen_calibration
-                .iter()
-                .all(|published| published.get().is_none())
-        );
-    }
-
-    #[test]
     fn revalidation_rejects_an_absent_to_insufficient_previous_population_race() {
         let mut builder = Tracegrams::builder();
-        let _first = builder.stage("first").unwrap();
+        let first = builder.stage("first").unwrap();
         let destination = builder.stage("destination").unwrap();
         let tracegrams = builder.build().unwrap();
-        for _ in 0..2 {
+        for stage in [first, first, destination, destination] {
             tracegrams.record_elapsed(
                 &mut tracegrams.start_manual(),
-                destination,
+                stage,
                 Duration::from_nanos(200),
             );
         }
-        let stages = [destination];
-        let initial = readiness_from_scans(&tracegrams.scan_calibration(&stages), 2);
-        assert!(initial.is_ready());
-        assert_eq!(
-            initial.stage(destination).unwrap().previous_cumulative(),
-            PopulationReadiness::AbsentNoPredecessor
-        );
+        assert_eq!(first_unready(&tracegrams.scan_calibration(), 2), None);
 
         tracegrams
             .inner
             .calibration_state
             .store(CALIBRATION_FREEZING, Ordering::Release);
-        let previous_bucket = bucketize(100, &tracegrams.inner.calibration_bounds);
+        let previous_bucket = bucketize(100, calibration_bounds());
         let previous = tracegrams
             .inner
             .layout
             .calibration(
                 destination.index(),
-                CalibrationDistribution::PreviousCumulative,
+                CalibrationPopulation::PreviousCumulative,
                 previous_bucket,
             )
             .unwrap();
         tracegrams.inner.increment(previous);
 
-        assert!(matches!(
-            tracegrams.freeze_after_claim(&stages, 2),
-            Err(FreezeError::NotReady { readiness })
-                if readiness.stage(destination).unwrap().previous_cumulative()
-                    == PopulationReadiness::Insufficient { samples: 1, minimum: 2 }
-        ));
+        assert_eq!(
+            tracegrams.freeze_after_claim(2),
+            Err(FreezeError::NotReady {
+                stage: destination,
+                population: CalibrationPopulation::PreviousCumulative,
+                samples: 1,
+                minimum: 2,
+            })
+        );
         assert_eq!(
             tracegrams.inner.calibration_state.load(Ordering::Acquire),
             CALIBRATION_COLLECTING

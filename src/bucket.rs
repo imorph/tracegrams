@@ -395,52 +395,61 @@ pub(crate) fn calibration_bucketize(value: u64, default_bucket: Bucket) -> usize
     first + CALIBRATION_BOUNDS[first..first + 3].partition_point(|&bound| value >= bound)
 }
 
+/// A nearest-rank bucket selection.
+///
+/// Matrix-derived thresholds use it as the first bucket classified as tail.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RankSelection {
-    pub(crate) bucket: usize,
-    pub(crate) rank: u128,
-    pub(crate) samples: u128,
+#[non_exhaustive]
+pub struct BucketThreshold {
+    /// Selected bucket.
+    pub bucket: usize,
+    /// Selected nearest rank, in `1..=samples`.
+    pub rank: u128,
+    /// Population size used by the rank.
+    pub samples: u128,
 }
 
+/// Terminal status of a calibration quantile estimate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TerminalStatus {
+#[non_exhaustive]
+pub enum CalibrationTerminal {
+    /// The selected rank is below the finite calibration range.
     Lower,
+    /// The selected rank has finite lower and upper bounds.
     Finite,
+    /// The selected rank is above the finite calibration range.
     Upper,
 }
 
+/// One nearest-rank estimate from the pinned calibration grid.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct QuantileEstimate {
-    pub(crate) selection: RankSelection,
-    pub(crate) lower_bound: Option<u64>,
-    pub(crate) upper_bound: Option<u64>,
-    pub(crate) value: Option<u64>,
-    pub(crate) max_relative_error: Option<f64>,
-    pub(crate) terminal: TerminalStatus,
+#[non_exhaustive]
+pub struct CalibrationEstimate {
+    /// Selected nearest rank.
+    pub rank: u128,
+    /// Scanned population size.
+    pub samples: u128,
+    /// Inclusive finite lower bound, when known.
+    pub lower_bound: Option<u64>,
+    /// Exclusive finite upper bound, when known.
+    pub upper_bound: Option<u64>,
+    /// Finite minimax threshold representative.
+    pub value: Option<u64>,
+    /// Maximum relative value error of the finite bucket.
+    pub max_relative_error: Option<f64>,
+    /// Whether the selected rank is finite or terminal.
+    pub terminal: CalibrationTerminal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QuantileError {
-    InvalidQuantile,
-    CounterTotalOverflow,
-    ShapeMismatch,
-}
-
-pub(crate) fn nearest_rank(
-    counts: &[u64],
-    quantile: f64,
-) -> Result<Option<RankSelection>, QuantileError> {
-    if !quantile.is_finite() || quantile <= 0.0 || quantile > 1.0 {
-        return Err(QuantileError::InvalidQuantile);
-    }
-
-    let samples = counts.iter().try_fold(0_u64, |total, count| {
-        total
-            .checked_add(*count)
-            .ok_or(QuantileError::CounterTotalOverflow)
-    })?;
+/// Selects the nearest-rank bucket, or `None` for an empty population.
+///
+/// The quantile is validated at build time. A population total above `u64`
+/// is outside the counter contract (see `increment_counter`).
+pub(crate) fn nearest_rank(counts: &[u64], quantile: f64) -> Option<BucketThreshold> {
+    assert!(quantile.is_finite() && quantile > 0.0 && quantile <= 1.0);
+    let samples = counts.iter().sum::<u64>();
     if samples == 0 {
-        return Ok(None);
+        return None;
     }
 
     let rank = quantile_rank(samples, quantile);
@@ -448,15 +457,15 @@ pub(crate) fn nearest_rank(
     for (bucket, count) in counts.iter().enumerate() {
         cumulative += u128::from(*count);
         if cumulative >= rank {
-            return Ok(Some(RankSelection {
+            return Some(BucketThreshold {
                 bucket,
                 rank,
                 samples: u128::from(samples),
-            }));
+            });
         }
     }
 
-    unreachable!("the checked total must be reached by its source counts");
+    unreachable!("the total must be reached by its source counts");
 }
 
 // Computes `ceil(samples * quantile)` from the exact binary value of the
@@ -482,50 +491,36 @@ fn quantile_rank(samples: u64, quantile: f64) -> u128 {
     rank.max(1).min(u128::from(samples))
 }
 
+/// Estimates the quantile on `bounds`, or `None` for an empty population.
 pub(crate) fn estimate_quantile(
     counts: &[u64],
     bounds: &[u64],
     quantile: f64,
-) -> Result<Option<QuantileEstimate>, QuantileError> {
-    if bounds.is_empty() || counts.len() != bounds.len() + 1 {
-        return Err(QuantileError::ShapeMismatch);
-    }
-
-    let Some(selection) = nearest_rank(counts, quantile)? else {
-        return Ok(None);
-    };
+) -> Option<CalibrationEstimate> {
+    assert!(!bounds.is_empty() && counts.len() == bounds.len() + 1);
+    let selection = nearest_rank(counts, quantile)?;
     let bucket = selection.bucket;
-    if bucket == 0 {
-        return Ok(Some(QuantileEstimate {
-            selection,
-            lower_bound: None,
-            upper_bound: Some(bounds[0]),
-            value: None,
-            max_relative_error: None,
-            terminal: TerminalStatus::Lower,
-        }));
-    }
-    if bucket == bounds.len() {
-        return Ok(Some(QuantileEstimate {
-            selection,
-            lower_bound: bounds.last().copied(),
-            upper_bound: None,
-            value: None,
-            max_relative_error: None,
-            terminal: TerminalStatus::Upper,
-        }));
-    }
-
-    let lower = bounds[bucket - 1];
-    let upper = bounds[bucket];
-    Ok(Some(QuantileEstimate {
-        selection,
-        lower_bound: Some(lower),
-        upper_bound: Some(upper),
-        value: finite_representative(lower, upper),
-        max_relative_error: relative_error(lower, upper),
-        terminal: TerminalStatus::Finite,
-    }))
+    let (lower_bound, upper_bound, terminal) = if bucket == 0 {
+        (None, Some(bounds[0]), CalibrationTerminal::Lower)
+    } else if bucket == bounds.len() {
+        (bounds.last().copied(), None, CalibrationTerminal::Upper)
+    } else {
+        (
+            Some(bounds[bucket - 1]),
+            Some(bounds[bucket]),
+            CalibrationTerminal::Finite,
+        )
+    };
+    let finite = lower_bound.zip(upper_bound);
+    Some(CalibrationEstimate {
+        rank: selection.rank,
+        samples: selection.samples,
+        lower_bound,
+        upper_bound,
+        value: finite.and_then(|(lower, upper)| finite_representative(lower, upper)),
+        max_relative_error: finite.and_then(|(lower, upper)| relative_error(lower, upper)),
+        terminal,
+    })
 }
 
 // The harmonic mean equalizes worst-case relative error at both bucket edges.
@@ -623,9 +618,9 @@ mod tests {
         rank.clamp(1, u128::from(samples))
     }
 
-    fn assert_rank_case(counts: &[u64], quantile: f64) -> Result<RankSelection, TestCaseError> {
+    fn assert_rank_case(counts: &[u64], quantile: f64) -> Result<BucketThreshold, TestCaseError> {
         let samples = counts.iter().copied().sum::<u64>();
-        let selection = nearest_rank(counts, quantile).unwrap().unwrap();
+        let selection = nearest_rank(counts, quantile).unwrap();
         let production_rank = quantile_rank(samples, quantile);
 
         prop_assert!((1..=u128::from(samples)).contains(&selection.rank));
@@ -806,77 +801,18 @@ mod tests {
 
     #[test]
     fn nearest_rank_handles_empty_singleton_and_population_boundaries() {
-        assert_eq!(nearest_rank(&[], 0.99), Ok(None));
+        assert_eq!(nearest_rank(&[], 0.99), None);
         assert_eq!(
             nearest_rank(&[0, 1, 0], 0.99),
-            Ok(Some(RankSelection {
+            Some(BucketThreshold {
                 bucket: 1,
                 rank: 1,
                 samples: 1,
-            }))
+            })
         );
-        assert_eq!(nearest_rank(&[1, 1, 1, 1], 0.5).unwrap().unwrap().bucket, 1);
-        assert_eq!(
-            nearest_rank(&[1, 1, 1, 1], 0.500_000_1)
-                .unwrap()
-                .unwrap()
-                .bucket,
-            2
-        );
-        assert_eq!(nearest_rank(&[1, 1, 1, 1], 1.0).unwrap().unwrap().bucket, 3);
-    }
-
-    #[test]
-    fn invalid_quantiles_are_rejected() {
-        for quantile in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            -0.5,
-            0.0,
-            1.000_000_1,
-        ] {
-            assert_eq!(
-                nearest_rank(&[1], quantile),
-                Err(QuantileError::InvalidQuantile)
-            );
-            assert_eq!(
-                estimate_quantile(&[1, 0], &[100], quantile),
-                Err(QuantileError::InvalidQuantile)
-            );
-        }
-    }
-
-    #[test]
-    fn counter_total_overflow_is_reported() {
-        assert_eq!(
-            nearest_rank(&[u64::MAX, 1], 0.99),
-            Err(QuantileError::CounterTotalOverflow)
-        );
-        assert_eq!(
-            estimate_quantile(&[u64::MAX, u64::MAX], &[100], 0.99),
-            Err(QuantileError::CounterTotalOverflow)
-        );
-    }
-
-    #[test]
-    fn estimate_rejects_mismatched_shapes() {
-        assert_eq!(
-            estimate_quantile(&[], &[], 0.99),
-            Err(QuantileError::ShapeMismatch)
-        );
-        assert_eq!(
-            estimate_quantile(&[1], &[], 0.99),
-            Err(QuantileError::ShapeMismatch)
-        );
-        assert_eq!(
-            estimate_quantile(&[1], &[100], 0.99),
-            Err(QuantileError::ShapeMismatch)
-        );
-        assert_eq!(
-            estimate_quantile(&[1, 2, 3], &[100], 0.99),
-            Err(QuantileError::ShapeMismatch)
-        );
+        assert_eq!(nearest_rank(&[1, 1, 1, 1], 0.5).unwrap().bucket, 1);
+        assert_eq!(nearest_rank(&[1, 1, 1, 1], 0.500_000_1).unwrap().bucket, 2);
+        assert_eq!(nearest_rank(&[1, 1, 1, 1], 1.0).unwrap().bucket, 3);
     }
 
     #[test]
@@ -885,8 +821,8 @@ mod tests {
         let mut counts = [0; CALIBRATION_BUCKETS];
 
         counts[0] = 1;
-        let lower = estimate_quantile(&counts, bounds, 0.99).unwrap().unwrap();
-        assert_eq!(lower.terminal, TerminalStatus::Lower);
+        let lower = estimate_quantile(&counts, bounds, 0.99).unwrap();
+        assert_eq!(lower.terminal, CalibrationTerminal::Lower);
         assert_eq!(lower.lower_bound, None);
         assert_eq!(lower.upper_bound, Some(100));
         assert_eq!(lower.value, None);
@@ -894,8 +830,8 @@ mod tests {
 
         counts[0] = 0;
         counts[CALIBRATION_BUCKETS - 1] = 1;
-        let upper = estimate_quantile(&counts, bounds, 0.99).unwrap().unwrap();
-        assert_eq!(upper.terminal, TerminalStatus::Upper);
+        let upper = estimate_quantile(&counts, bounds, 0.99).unwrap();
+        assert_eq!(upper.terminal, CalibrationTerminal::Upper);
         assert_eq!(upper.lower_bound, Some(10_000_000_000));
         assert_eq!(upper.upper_bound, None);
         assert_eq!(upper.value, None);
@@ -911,10 +847,8 @@ mod tests {
 
         let mut counts = [0; CALIBRATION_BUCKETS];
         counts[CALIBRATION_BUCKETS - 2] = 1;
-        let estimate = estimate_quantile(&counts, calibration_bounds(), 0.99)
-            .unwrap()
-            .unwrap();
-        assert_eq!(estimate.terminal, TerminalStatus::Finite);
+        let estimate = estimate_quantile(&counts, calibration_bounds(), 0.99).unwrap();
+        assert_eq!(estimate.terminal, CalibrationTerminal::Finite);
         assert_eq!(estimate.lower_bound, Some(9_284_145_445));
         assert_eq!(estimate.upper_bound, Some(10_000_000_000));
         assert_eq!(estimate.value, Some(9_628_785_959));

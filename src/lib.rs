@@ -12,7 +12,7 @@
 //!
 //! ```
 //! use std::time::Duration;
-//! use tracegrams::{DiagnoseConfig, FreezeCriteria, Outcome, Tracegrams};
+//! use tracegrams::{DiagnoseConfig, Outcome, Tracegrams};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut builder = Tracegrams::builder();
@@ -31,7 +31,7 @@
 //!     Duration::from_millis(3),
 //!     Outcome::Success,
 //! );
-//! tracegrams.try_freeze_calibration(FreezeCriteria::all_stages(1))?;
+//! tracegrams.try_freeze_calibration(1)?;
 //!
 //! let before = tracegrams.snapshot_relaxed();
 //! let mut incident = tracegrams.start_manual();
@@ -75,19 +75,19 @@ mod matrix;
 mod recorder;
 mod snapshot;
 
+pub use bucket::{BucketThreshold, CalibrationEstimate, CalibrationTerminal};
 pub use calibration::{
-    CalibrationEstimate, CalibrationPopulationReport, CalibrationReadiness, CalibrationTerminal,
-    CalibrationThresholdAvailability, FreezeCriteria, FreezeError, FreezeReport,
-    PopulationReadiness, StageCalibrationReadiness, StageCalibrationReport,
+    CalibrationPopulationReport, CalibrationThresholdAvailability, FreezeError, FreezeReport,
+    StageCalibrationReport,
 };
 pub use context::{Ctx, ManualCtx, Outcome};
 pub use diagnose::{
-    BucketThreshold, CalibratedOnlineScores, CalibratedThresholds, Classification, DiagnoseConfig,
-    DiagnoseError, DiagnosisReport, MatrixScores, MatrixThresholds, Score, ScorePath,
-    ScorePopulation, ScoreStatus,
+    CalibratedOnlineScores, CalibratedThresholds, Classification, DiagnoseConfig, DiagnoseError,
+    DiagnosisReport, MatrixScores, MatrixThresholds, Score, ScoreStatus, Scores,
 };
 pub use init::{InitError, MemoryEstimate, StageId, Tracegrams, TracegramsBuilder};
+pub use recorder::CalibrationPopulation;
 pub use snapshot::{
-    CalibrationPopulation, CalibrationState, CompletionCounts, Consistency, DeltaError,
-    DeltaSnapshot, Diagnostics, SampleCounts, ScoreAvailability, Snapshot, StageMetadata,
+    CalibrationState, CompletionCounts, DeltaError, Diagnostics, SampleCounts, Snapshot,
+    StageMetadata,
 };

@@ -6,12 +6,10 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::bucket::{calibration_bounds, default_bounds};
 use crate::calibration::FrozenStageCalibration;
 use crate::recorder::{FixedStorageLayout, Inner};
 
 const DEFAULT_TAIL_QUANTILE: f64 = 0.99;
-const DEFAULT_MEMORY_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STAGES: usize = 64;
 const FIRST_REGISTRY_COOKIE: u64 = 1;
 const MAX_REGISTRY_COOKIE: u64 = u32::MAX as u64;
@@ -59,32 +57,20 @@ impl fmt::Debug for StageId {
 
 /// Itemized recorder memory estimate, excluding allocator rounding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct MemoryEstimate {
-    matrix: usize,
-    calibration: usize,
-    metadata: usize,
-    total: usize,
+    /// Bytes used by ordinary distributions and transition matrices.
+    pub matrix_bytes: usize,
+    /// Bytes used by calibration distributions.
+    pub calibration_bytes: usize,
+    /// Bytes used by publication cells, names, auxiliary counters, and recorder metadata.
+    pub metadata_bytes: usize,
 }
 
 impl MemoryEstimate {
-    /// Bytes used by ordinary distributions and transition matrices.
-    pub const fn matrix_bytes(self) -> usize {
-        self.matrix
-    }
-
-    /// Bytes used by calibration distributions.
-    pub const fn calibration_bytes(self) -> usize {
-        self.calibration
-    }
-
-    /// Bytes used by bounds, publication cells, names, auxiliary counters, and recorder metadata.
-    pub const fn metadata_bytes(self) -> usize {
-        self.metadata
-    }
-
     /// Total bytes included in the estimate.
     pub const fn total_bytes(self) -> usize {
-        self.total
+        self.matrix_bytes + self.calibration_bytes + self.metadata_bytes
     }
 }
 
@@ -115,13 +101,6 @@ pub enum InitError {
     RegistryCookieExhausted,
     /// Checked storage-size arithmetic overflowed.
     SizeOverflow,
-    /// The recorder estimate exceeded the configured budget.
-    MemoryBudgetExceeded {
-        /// Estimated bytes required.
-        required: usize,
-        /// Configured byte budget.
-        budget: usize,
-    },
 }
 
 impl fmt::Display for InitError {
@@ -142,10 +121,6 @@ impl fmt::Display for InitError {
                 formatter.write_str("registry-cookie space is exhausted")
             }
             Self::SizeOverflow => formatter.write_str("recorder size calculation overflowed"),
-            Self::MemoryBudgetExceeded { required, budget } => write!(
-                formatter,
-                "recorder requires {required} bytes, exceeding the {budget}-byte budget"
-            ),
         }
     }
 }
@@ -158,7 +133,6 @@ pub struct TracegramsBuilder {
     cookie: Option<RegistryCookie>,
     stage_names: Vec<Box<str>>,
     tail_quantile: f64,
-    memory_budget_bytes: usize,
 }
 
 impl TracegramsBuilder {
@@ -167,7 +141,6 @@ impl TracegramsBuilder {
             cookie: claim_registry_cookie(&NEXT_REGISTRY_COOKIE),
             stage_names: Vec::new(),
             tail_quantile: DEFAULT_TAIL_QUANTILE,
-            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         }
     }
 
@@ -208,36 +181,17 @@ impl TracegramsBuilder {
         Ok(self)
     }
 
-    /// Sets the maximum recorder estimate accepted by [`Self::build`].
-    pub const fn memory_budget_bytes(&mut self, budget: usize) -> &mut Self {
-        self.memory_budget_bytes = budget;
-        self
-    }
-
-    /// Estimates all fixed recorder-owned memory before building.
-    pub fn estimated_memory(&self) -> Result<MemoryEstimate, InitError> {
-        let layout = self.storage_layout()?;
-        estimate_memory(layout, self.stage_names.iter().map(|name| name.len()))
-    }
-
     /// Validates the configuration and allocates one fixed shared recorder.
     pub fn build(self) -> Result<Tracegrams, InitError> {
         let cookie = self.cookie.ok_or(InitError::RegistryCookieExhausted)?;
         let layout = self.storage_layout()?;
         let estimate = estimate_memory(layout, self.stage_names.iter().map(|name| name.len()))?;
-        if estimate.total > self.memory_budget_bytes {
-            return Err(InitError::MemoryBudgetExceeded {
-                required: estimate.total,
-                budget: self.memory_budget_bytes,
-            });
-        }
 
         Ok(Tracegrams {
             inner: Arc::new(Inner::new(
                 cookie,
                 self.stage_names.into_boxed_slice(),
                 self.tail_quantile,
-                self.memory_budget_bytes,
                 estimate,
                 layout,
             )),
@@ -269,7 +223,6 @@ impl Tracegrams {
     /// let _parse = builder.stage("parse")?;
     /// let _db = builder.stage("db")?;
     /// builder.tail_quantile(0.99)?;
-    /// builder.memory_budget_bytes(8 * 1024 * 1024);
     /// let _tracegrams = builder.build()?;
     /// # Ok(())
     /// # }
@@ -298,7 +251,6 @@ impl fmt::Debug for Tracegrams {
             .debug_struct("Tracegrams")
             .field("stages", &self.inner.stage_names.len())
             .field("tail_quantile", &self.inner.tail_quantile)
-            .field("memory_budget_bytes", &self.inner.memory_budget_bytes)
             .field("memory_estimate", &self.inner.memory_estimate)
             .finish_non_exhaustive()
     }
@@ -344,12 +296,6 @@ fn estimate_memory(
         FixedStorageLayout::diagnostic_counter_count(),
         counter_bytes,
     )?;
-    let bounds_count = default_bounds()
-        .len()
-        .checked_add(calibration_bounds().len())
-        .ok_or(InitError::SizeOverflow)?;
-    let bounds_bytes = checked_bytes(bounds_count, size_of::<u64>())?;
-
     let stage_headers = checked_bytes(layout.stage_count(), size_of::<Box<str>>())?;
     let stage_name_bytes = stage_name_lengths
         .into_iter()
@@ -370,7 +316,6 @@ fn estimate_memory(
         calibration_bytes,
         calibration_threshold_bytes,
         online_bytes,
-        bounds_bytes,
         stage_metadata_bytes,
         completion_bytes,
         diagnostics_bytes,
@@ -386,10 +331,9 @@ fn estimate_memory(
         .and_then(|bytes| bytes.checked_sub(calibration_bytes))
         .ok_or(InitError::SizeOverflow)?;
     Ok(MemoryEstimate {
-        matrix: matrix_bytes,
-        calibration: calibration_bytes,
-        metadata: metadata_bytes,
-        total: total_bytes,
+        matrix_bytes,
+        calibration_bytes,
+        metadata_bytes,
     })
 }
 
@@ -433,7 +377,6 @@ mod tests {
             cookie: None,
             stage_names: Vec::new(),
             tail_quantile: DEFAULT_TAIL_QUANTILE,
-            memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
         };
 
         assert_eq!(
@@ -467,14 +410,6 @@ mod tests {
 
         assert!(Arc::ptr_eq(&tracegrams.inner, &cloned.inner));
         assert_eq!(tracegrams.inner.stage_names.len(), 3);
-        assert_eq!(
-            tracegrams.inner.default_bounds.len(),
-            default_bounds().len()
-        );
-        assert_eq!(
-            tracegrams.inner.calibration_bounds.len(),
-            calibration_bounds().len()
-        );
         assert_eq!(
             tracegrams.inner.counters.len(),
             tracegrams.inner.layout.counter_count()

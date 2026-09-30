@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::bucket::{BUCKETS, Bucket, calibration_bucketize, default_bucketize};
 use crate::init::{RegistryCookie, StageId, Tracegrams};
 use crate::recorder::{
-    CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationDistribution,
+    CALIBRATION_COLLECTING, CALIBRATION_FREEZING, CALIBRATION_FROZEN, CalibrationPopulation,
     DiagnosticCounter, first_online_counter, predecessor_online_counter,
 };
 
@@ -513,12 +513,12 @@ impl Tracegrams {
                 };
                 self.inner.increment(self.inner.layout.calibration_index(
                     stage,
-                    CalibrationDistribution::Local,
+                    CalibrationPopulation::Local,
                     calibration_local,
                 ));
                 self.inner.increment(self.inner.layout.calibration_index(
                     stage,
-                    CalibrationDistribution::CumulativeAfter,
+                    CalibrationPopulation::CumulativeAfter,
                     calibration_after,
                 ));
                 if let Some(previous) = previous {
@@ -526,7 +526,7 @@ impl Tracegrams {
                         calibration_bucketize(previous_cumulative_ns, previous.cumulative_bucket);
                     self.inner.increment(self.inner.layout.calibration_index(
                         stage,
-                        CalibrationDistribution::PreviousCumulative,
+                        CalibrationPopulation::PreviousCumulative,
                         calibration_previous,
                     ));
                 }
@@ -718,12 +718,12 @@ mod tests {
         let calibration_local = bucketize(local_ns, crate::bucket::calibration_bounds());
         let calibration_after = bucketize(cumulative_ns, crate::bucket::calibration_bounds());
         counters[layout
-            .calibration(stage, CalibrationDistribution::Local, calibration_local)
+            .calibration(stage, CalibrationPopulation::Local, calibration_local)
             .unwrap()] += 1;
         counters[layout
             .calibration(
                 stage,
-                CalibrationDistribution::CumulativeAfter,
+                CalibrationPopulation::CumulativeAfter,
                 calibration_after,
             )
             .unwrap()] += 1;
@@ -733,7 +733,7 @@ mod tests {
             counters[layout
                 .calibration(
                     stage,
-                    CalibrationDistribution::PreviousCumulative,
+                    CalibrationPopulation::PreviousCumulative,
                     calibration_previous,
                 )
                 .unwrap()] += 1;
@@ -822,18 +822,16 @@ mod tests {
             stage,
             Duration::from_nanos(100),
         );
-        tracegrams
-            .try_freeze_calibration(crate::FreezeCriteria::all_stages(1))
-            .unwrap();
+        tracegrams.try_freeze_calibration(1).unwrap();
         install_test_clock(&tracegrams, &[(1_000, false), (2_000, false)]);
 
         tracegrams.finish(tracegrams.start(), stage, Outcome::Success);
 
         let snapshot = tracegrams.snapshot_relaxed();
-        assert_eq!(snapshot.sample_counts(stage).unwrap().online(), 1);
+        assert_eq!(snapshot.sample_counts(stage).unwrap().online, 1);
         let scores = snapshot.calibrated_online_scores(stage).unwrap();
-        assert_eq!(scores.tail_onset().numerator(), 1);
-        assert_eq!(scores.tail_onset().denominator(), 1);
+        assert_eq!(scores.scores.tail_onset.numerator(), 1);
+        assert_eq!(scores.scores.tail_onset.denominator(), 1);
         assert_test_clock_consumed(&tracegrams, 2);
     }
 
@@ -1222,7 +1220,7 @@ mod tests {
                     .layout
                     .calibration(
                         first.index(),
-                        CalibrationDistribution::Local,
+                        CalibrationPopulation::Local,
                         CALIBRATION_BUCKETS - 1,
                     )
                     .unwrap(),
@@ -1352,9 +1350,9 @@ mod tests {
         tracegrams.record_elapsed(&mut context, parse, Duration::from_nanos(100));
         tracegrams.finish_manual(context, db, Duration::from_nanos(200), Outcome::Success);
 
-        let previous_bucket = bucketize(100, &tracegrams.inner.default_bounds);
-        let local_bucket = bucketize(200, &tracegrams.inner.default_bounds);
-        let after_bucket = bucketize(300, &tracegrams.inner.default_bounds);
+        let previous_bucket = bucketize(100, crate::bucket::default_bounds());
+        let local_bucket = bucketize(200, crate::bucket::default_bounds());
+        let after_bucket = bucketize(300, crate::bucket::default_bounds());
         assert_eq!(
             count(
                 &tracegrams,
@@ -1424,7 +1422,7 @@ mod tests {
             Duration::from_micros(1),
         );
 
-        let ordinary_bucket = bucketize(1_000, &tracegrams.inner.default_bounds);
+        let ordinary_bucket = bucketize(1_000, crate::bucket::default_bounds());
         assert_eq!(
             count(
                 &tracegrams,
@@ -1437,9 +1435,9 @@ mod tests {
             1
         );
         for distribution in [
-            CalibrationDistribution::Local,
-            CalibrationDistribution::CumulativeAfter,
-            CalibrationDistribution::PreviousCumulative,
+            CalibrationPopulation::Local,
+            CalibrationPopulation::CumulativeAfter,
+            CalibrationPopulation::PreviousCumulative,
         ] {
             assert_eq!(
                 total(
@@ -1473,8 +1471,8 @@ mod tests {
         let mut context = tracegrams.start_manual();
         tracegrams.record_elapsed(&mut context, first, Duration::from_micros(1));
 
-        let ordinary_bucket = bucketize(1_000, &tracegrams.inner.default_bounds);
-        let calibration_bucket = bucketize(1_000, &tracegrams.inner.calibration_bounds);
+        let ordinary_bucket = bucketize(1_000, crate::bucket::default_bounds());
+        let calibration_bucket = bucketize(1_000, crate::bucket::calibration_bounds());
         assert_eq!(
             count(
                 &tracegrams,
@@ -1519,7 +1517,7 @@ mod tests {
                         .layout
                         .calibration(
                             first.index(),
-                            CalibrationDistribution::PreviousCumulative,
+                            CalibrationPopulation::PreviousCumulative,
                             bucket,
                         )
                         .unwrap()
@@ -1535,7 +1533,7 @@ mod tests {
                     .layout
                     .calibration(
                         first.index(),
-                        CalibrationDistribution::Local,
+                        CalibrationPopulation::Local,
                         calibration_bucket,
                     )
                     .unwrap(),
@@ -1599,9 +1597,9 @@ mod tests {
         }
 
         let distributions = [
-            CalibrationDistribution::Local,
-            CalibrationDistribution::CumulativeAfter,
-            CalibrationDistribution::PreviousCumulative,
+            CalibrationPopulation::Local,
+            CalibrationPopulation::CumulativeAfter,
+            CalibrationPopulation::PreviousCumulative,
         ];
         for (destination, &stage_id) in stages.iter().enumerate() {
             let first = tracegrams.validate_mark(cookie, None, stage_id).unwrap();

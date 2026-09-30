@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use tracegrams::{Classification, DiagnoseConfig, FreezeCriteria, Outcome, StageId, Tracegrams};
+use tracegrams::{Classification, DiagnoseConfig, Outcome, StageId, Tracegrams};
 
 const CALIBRATION_REQUESTS: u64 = 100;
 
@@ -38,12 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ],
         );
     }
-    assert!(
-        tracegrams
-            .calibration_readiness(CALIBRATION_REQUESTS)
-            .is_ready()
-    );
-    tracegrams.try_freeze_calibration(FreezeCriteria::all_stages(CALIBRATION_REQUESTS))?;
+    tracegrams.try_freeze_calibration(CALIBRATION_REQUESTS)?;
 
     let before = tracegrams.snapshot_relaxed();
     record_manual_request(

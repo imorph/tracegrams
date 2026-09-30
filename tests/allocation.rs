@@ -6,7 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tracegrams::{FreezeCriteria, Outcome, StageId, Tracegrams};
+use tracegrams::{Outcome, StageId, Tracegrams};
 
 struct CountingAllocator;
 
@@ -69,9 +69,7 @@ fn frozen_recorder() -> (Tracegrams, StageId) {
         stage,
         Duration::from_micros(1),
     );
-    tracegrams
-        .try_freeze_calibration(FreezeCriteria::all_stages(1))
-        .unwrap();
+    tracegrams.try_freeze_calibration(1).unwrap();
     (tracegrams, stage)
 }
 
@@ -84,9 +82,7 @@ fn two_stage_recorder(frozen: bool) -> (Tracegrams, StageId, StageId) {
         let mut context = tracegrams.start_manual();
         tracegrams.record_elapsed(&mut context, first, Duration::from_micros(1));
         tracegrams.record_elapsed(&mut context, second, Duration::from_micros(1));
-        tracegrams
-            .try_freeze_calibration(FreezeCriteria::all_stages(1))
-            .unwrap();
+        tracegrams.try_freeze_calibration(1).unwrap();
     }
     (tracegrams, first, second)
 }
