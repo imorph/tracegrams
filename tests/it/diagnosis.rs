@@ -74,6 +74,7 @@ fn matrix_scores_match_the_predecessor_only_poc_fixture() {
     assert_score(scores.scores.local_tail_origin_tail, 5, 15);
     assert_score(scores.scores.local_tail_rate_given_prev_tail, 5, 10);
     assert_score(scores.scores.local_tail_rate_given_prev_not_tail, 10, 90);
+    // Lift = (5/10) / (10/90) = (5 * 90) / (10 * 10) = 450/100.
     assert_score(scores.scores.amplification_lift, 450, 100);
     assert_score(scores.scores.carry_through, 5, 10);
     assert_score(scores.scores.tail_onset, 10, 20);
@@ -238,6 +239,27 @@ fn snapshot_and_delta_matrix_scores_are_pure_and_deterministic() {
     let expected = after.matrix_scores(destination).unwrap();
 
     assert_eq!(after.matrix_scores(destination).unwrap(), expected);
+    let window = after.delta(&before).unwrap();
+    assert_eq!(window.matrix_scores(destination).unwrap(), expected);
+
+    let mut context = tracegrams.start_manual();
+    tracegrams.record_elapsed(&mut context, first, Duration::from_micros(10));
+    tracegrams.finish_manual(
+        context,
+        destination,
+        Duration::from_secs(1),
+        Outcome::Success,
+    );
+    let fresh = tracegrams
+        .snapshot_relaxed()
+        .matrix_scores(destination)
+        .unwrap();
+    assert_eq!(fresh.cause_samples, 2);
+    assert_eq!(fresh.incoming_samples, 2);
+    assert_ne!(fresh.thresholds.local, expected.thresholds.local);
+    assert_ne!(fresh, expected);
+    assert_eq!(after.matrix_scores(destination).unwrap(), expected);
+    assert_eq!(window.matrix_scores(destination).unwrap(), expected);
     assert_eq!(
         after
             .delta(&before)
@@ -246,14 +268,6 @@ fn snapshot_and_delta_matrix_scores_are_pure_and_deterministic() {
             .unwrap(),
         expected
     );
-
-    tracegrams.finish_manual(
-        tracegrams.start_manual(),
-        destination,
-        Duration::from_secs(1),
-        Outcome::Success,
-    );
-    assert_eq!(after.matrix_scores(destination).unwrap(), expected);
 }
 
 #[test]
@@ -639,6 +653,70 @@ fn diagnosis_report_and_display_are_pure_stable_and_path_explicit() {
             "carry_through>=0.800000 (experimental PoC values)",
         )
     );
+}
+
+#[test]
+fn custom_diagnosis_config_is_preserved_without_the_experimental_label() {
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let destination = builder.stage("destination").unwrap();
+    let tracegrams = builder.build().unwrap();
+    let mut context = tracegrams.start_manual();
+    tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
+    tracegrams.record_elapsed(&mut context, destination, Duration::from_nanos(200));
+    tracegrams.try_freeze_calibration(1).unwrap();
+    let snapshot = tracegrams.snapshot_relaxed();
+
+    // Change one field at a time: matching only part of the PoC policy must
+    // not label a caller-selected policy as the experimental defaults.
+    for config in [
+        DiagnoseConfig {
+            onset_threshold: 0.71,
+            ..DiagnoseConfig::experimental_defaults()
+        },
+        DiagnoseConfig {
+            amplification_lift_threshold: 11.0,
+            ..DiagnoseConfig::experimental_defaults()
+        },
+        DiagnoseConfig {
+            carry_through_threshold: 0.81,
+            ..DiagnoseConfig::experimental_defaults()
+        },
+    ] {
+        let report = snapshot.diagnose(destination, &config).unwrap();
+        assert_eq!(report.stage(), destination);
+        assert_eq!(report.stage_name(), "destination");
+        assert_eq!(report.config(), config);
+        assert_eq!(
+            *report.matrix_derived(),
+            snapshot.matrix_scores(destination).unwrap()
+        );
+        assert!(!report.to_string().contains("(experimental PoC values)"));
+    }
+}
+
+#[test]
+fn diagnosis_errors_display_exact_messages() {
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let second = builder.stage("second").unwrap();
+
+    for (error, expected) in [
+        (
+            DiagnoseError::ForeignStage { stage: second },
+            "StageId(1) belongs to another recorder",
+        ),
+        (
+            DiagnoseError::NotCalibrated { stage: first },
+            "StageId(0) is not calibrated",
+        ),
+        (
+            DiagnoseError::WindowSpansFreeze,
+            "online diagnosis cannot span the calibration freeze",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
 }
 
 #[test]

@@ -7,6 +7,25 @@ use std::time::Duration;
 use tracegrams::{CalibrationPopulation, CalibrationState, DeltaError, Outcome, Tracegrams};
 
 #[test]
+fn delta_errors_display_exact_messages() {
+    for (error, expected) in [
+        (
+            DeltaError::RegistryMismatch,
+            "snapshots belong to different registries",
+        ),
+        (
+            DeltaError::CounterUnderflow {
+                earlier: 23,
+                later: 17,
+            },
+            "later counter value 17 is below earlier value 23",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn quiesced_snapshot_owns_recorded_stage_data() {
     let mut builder = Tracegrams::builder();
     let parse = builder.stage("parse").unwrap();

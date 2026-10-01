@@ -10,6 +10,64 @@ use tracegrams::{
 };
 
 #[test]
+fn freeze_errors_display_exact_messages() {
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let second = builder.stage("second").unwrap();
+    let mut cases = vec![
+        (
+            FreezeError::NotReady {
+                stage: second,
+                population: CalibrationPopulation::PreviousCumulative,
+                samples: 17,
+                minimum: 23,
+            },
+            "StageId(1) PreviousCumulative has 17 calibration samples; 23 required",
+        ),
+        (
+            FreezeError::NotReady {
+                stage: first,
+                population: CalibrationPopulation::CumulativeAfter,
+                samples: 0,
+                minimum: 1,
+            },
+            "StageId(0) CumulativeAfter has 0 calibration samples; 1 required",
+        ),
+        (
+            FreezeError::AlreadyFreezing,
+            "calibration is already freezing",
+        ),
+        (FreezeError::AlreadyFrozen, "calibration is already frozen"),
+    ];
+    for (duration, expected) in [
+        (
+            Duration::from_nanos(50),
+            "calibration range is insufficient for StageId(1) Local: Lower",
+        ),
+        (
+            Duration::from_secs(10),
+            "calibration range is insufficient for StageId(1) Local: Upper",
+        ),
+    ] {
+        let mut builder = Tracegrams::builder();
+        let first = builder.stage("first").unwrap();
+        let second = builder.stage("second").unwrap();
+        let tracegrams = builder.build().unwrap();
+        tracegrams.record_elapsed(
+            &mut tracegrams.start_manual(),
+            first,
+            Duration::from_nanos(100),
+        );
+        tracegrams.record_elapsed(&mut tracegrams.start_manual(), second, duration);
+        cases.push((tracegrams.try_freeze_calibration(1).unwrap_err(), expected));
+    }
+
+    for (error, expected) in cases {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn freeze_publishes_one_complete_relaxed_bundle() {
     let mut builder = Tracegrams::builder();
     let entry = builder.stage("entry").unwrap();

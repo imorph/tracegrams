@@ -101,11 +101,46 @@ fn memory_estimate_is_itemized_and_pins_the_matrix_formula() {
         .unwrap()
         .snapshot_relaxed()
         .memory_estimate();
+    // 8 bytes/counter × [6 × (2 distributions × 64 + 64² cause cells)
+    //                   + 5 × 64² incoming cells] = 366_592 bytes.
     assert_eq!(estimate.matrix_bytes, 366_592);
+    // 3 calibration distributions × 250 buckets × 8 bytes = 6_000 bytes/stage.
     assert_eq!(estimate.calibration_bytes, 6 * 6_000);
     assert!(estimate.metadata_bytes > 0);
     assert_eq!(
         estimate.total_bytes(),
         estimate.matrix_bytes + estimate.calibration_bytes + estimate.metadata_bytes
     );
+}
+
+#[test]
+fn initialization_errors_display_exact_messages() {
+    for (error, expected) in [
+        (InitError::EmptyStageName, "stage name must not be empty"),
+        (
+            InitError::DuplicateStageName {
+                name: "db".to_owned(),
+            },
+            "stage name \"db\" is already registered",
+        ),
+        (InitError::NoStages, "at least one stage must be registered"),
+        (
+            InitError::TooManyStages { maximum: 64 },
+            "at most 64 stages may be registered",
+        ),
+        (
+            InitError::InvalidTailQuantile { value: 1.25 },
+            "tail quantile 1.25 is outside (0, 1]",
+        ),
+        (
+            InitError::RegistryCookieExhausted,
+            "registry-cookie space is exhausted",
+        ),
+        (
+            InitError::SizeOverflow,
+            "recorder size calculation overflowed",
+        ),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
 }

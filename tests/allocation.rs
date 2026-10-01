@@ -118,6 +118,7 @@ fn assert_zero_allocations_for_predecessor_updates(
     tracegrams: &Tracegrams,
     first: StageId,
     second: StageId,
+    frozen: bool,
 ) {
     let mut manual = tracegrams.start_manual();
     tracegrams.record_elapsed(&mut manual, first, Duration::from_micros(1));
@@ -130,6 +131,30 @@ fn assert_zero_allocations_for_predecessor_updates(
     tracegrams.mark(&mut clocked, first);
     let ((), allocations) = allocations_during(|| tracegrams.mark(&mut clocked, second));
     assert_eq!(allocations, 0, "clocked predecessor checkpoint allocated");
+
+    let mut manual = tracegrams.start_manual();
+    tracegrams.record_elapsed(&mut manual, first, Duration::from_micros(1));
+    let ((), allocations) = allocations_during(|| {
+        tracegrams.finish_manual(manual, second, Duration::from_micros(1), Outcome::Success);
+    });
+    assert_eq!(allocations, 0, "manual predecessor finish allocated");
+
+    let mut clocked = tracegrams.start();
+    tracegrams.mark(&mut clocked, first);
+    let ((), allocations) =
+        allocations_during(|| tracegrams.finish(clocked, second, Outcome::Success));
+    assert_eq!(allocations, 0, "clocked predecessor finish allocated");
+
+    let snapshot = tracegrams.snapshot_relaxed();
+    let samples = snapshot.sample_counts(second).unwrap();
+    // Four measured requests, plus one calibration request in the frozen fixture.
+    let expected_samples = if frozen { 5 } else { 4 };
+    assert_eq!(samples.local, expected_samples);
+    assert_eq!(samples.cause, expected_samples);
+    assert_eq!(samples.incoming, expected_samples);
+    assert_eq!(samples.online, if frozen { 4 } else { 0 });
+    assert_eq!(snapshot.completion_counts(second).unwrap().success, 2);
+    assert_eq!(snapshot.diagnostics().total(), 0);
 }
 
 #[test]
@@ -141,8 +166,8 @@ fn core_starts_and_checkpoints_allocate_nothing_after_build() {
     assert_zero_allocations_for_hot_plane(&frozen, frozen_stage);
 
     let (collecting, first, second) = two_stage_recorder(false);
-    assert_zero_allocations_for_predecessor_updates(&collecting, first, second);
+    assert_zero_allocations_for_predecessor_updates(&collecting, first, second, false);
 
     let (frozen, first, second) = two_stage_recorder(true);
-    assert_zero_allocations_for_predecessor_updates(&frozen, first, second);
+    assert_zero_allocations_for_predecessor_updates(&frozen, first, second, true);
 }
