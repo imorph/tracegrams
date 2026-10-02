@@ -1,13 +1,16 @@
 //! Checkpoint overhead, contention, snapshot, and memory screening harness.
 //!
-//! Timings are medians of aggregate-repeat averages, never per-operation
-//! percentiles. First-mark cells use a fresh context and one finish-only
-//! mark; transition cells record an intermediate stage and then finish at a
-//! second stage. Pipelines of 3+ stages also exercise non-final predecessor
+//! Checkpoint timings are medians of aggregate-repeat averages, never
+//! per-operation percentiles. First-mark cells use a fresh context and one
+//! finish-only mark; transition cells record an intermediate stage and then
+//! finish at a second stage. Pipelines of 3+ stages also exercise non-final predecessor
 //! marks. Hot-bucket writers contend on the same counter cells, while the
 //! transition spread visits the Cartesian product of previous/local buckets.
 //! Clocked cells include all request-start and checkpoint clock reads.
 //! Multiwriter ns/checkpoint is inverse aggregate throughput, not latency.
+//! Read-path cells time one frozen snapshot -> delta -> all-stage diagnosis
+//! cycle per repeat without concurrent writers. Freeze cells use fresh,
+//! populated recorders. Setup, validation and result destruction are untimed.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -25,7 +28,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tracegrams::{DiagnoseConfig, Outcome, Snapshot, StageId, Tracegrams};
+use tracegrams::{
+    CalibrationPopulation, CalibrationState, CalibrationThresholdAvailability, DiagnoseConfig,
+    FreezeError, Outcome, Snapshot, StageId, Tracegrams,
+};
 
 const DEFAULT_CHECKPOINTS_PER_WRITER: u64 = 1_000_000;
 const DEFAULT_WARMUP_CHECKPOINTS_PER_WRITER: u64 = 50_000;
@@ -347,6 +353,36 @@ struct SnapshotResult {
 }
 
 #[derive(Serialize)]
+struct ReadTiming {
+    operation: &'static str,
+    raw_elapsed_ns: Vec<u128>,
+    median_ns: f64,
+    median_absolute_deviation_ns: f64,
+}
+
+impl ReadTiming {
+    fn new(operation: &'static str, raw_elapsed_ns: Vec<u128>) -> Self {
+        let samples = raw_elapsed_ns
+            .iter()
+            .map(|ns| *ns as f64)
+            .collect::<Vec<_>>();
+        Self {
+            operation,
+            median_ns: median(&samples),
+            median_absolute_deviation_ns: median_absolute_deviation(&samples),
+            raw_elapsed_ns,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ReadPathResult {
+    stages: usize,
+    timings: Vec<ReadTiming>,
+    stage_validation: Vec<StageObservation>,
+}
+
+#[derive(Serialize)]
 struct MemoryResult {
     stages: usize,
     matrix_bytes: usize,
@@ -373,6 +409,7 @@ struct ScreeningReport {
     cells: Vec<CellResult>,
     rejections: Vec<RejectionResult>,
     snapshots: Vec<SnapshotResult>,
+    read_paths: Vec<ReadPathResult>,
     memory: MemoryResult,
     budgets: Vec<BudgetResult>,
 }
@@ -495,11 +532,15 @@ fn run(options: &Options) -> Result<ScreeningReport, String> {
         .into_iter()
         .map(|stages| measure_snapshot(stages, options.repeats))
         .collect::<Result<Vec<_>, _>>()?;
+    let read_paths = [6, 32, 64]
+        .into_iter()
+        .map(|stages| measure_read_path(stages, options.repeats))
+        .collect::<Result<Vec<_>, _>>()?;
     let memory = measure_memory(32)?;
     let budgets = evaluate_budgets(&cells, &snapshots, &memory, options.contended_writers);
 
     Ok(ScreeningReport {
-        schema_version: 4,
+        schema_version: 5,
         environment: environment(),
         protocol: Protocol {
             requests_per_writer: options.checkpoints_per_writer,
@@ -509,11 +550,12 @@ fn run(options: &Options) -> Result<ScreeningReport, String> {
             release_equivalent,
             preregistered_shape,
             operation_shape: "first-mark: start + finish; transition: start + mark(a) + finish(b); N-stage pipeline: start + N-1 marks + finish; ns/checkpoint = ns/request / N, not isolated middle-mark latency; clocked cells include all clock reads; spread transitions cycle all 64 x 64 previous/local bucket pairs",
-            timing_interpretation: "median and dispersion across aggregate-repeat averages; not per-operation percentiles; multiwriter ns/checkpoint is inverse aggregate throughput; no no-op subtraction; rejected calls are secondary and ungated",
+            timing_interpretation: "checkpoint median and dispersion across aggregate-repeat averages; not per-operation percentiles; multiwriter ns/checkpoint is inverse aggregate throughput; no no-op subtraction; rejected calls are secondary and ungated; read/freeze cells: one call or cycle per repeat after three warmups, medians and MAD, no performance gates; frozen read fixture: one calibration request, 65 pre-window and 4097 in-window spread requests, no concurrent writers; timings include API allocations and phase clock reads, exclude setup, validation and result destruction; freeze uses fresh recorders with minimum=2, success has two full hot requests, NotReady has one full request and one missing the last stage",
         },
         cells,
         rejections,
         snapshots,
+        read_paths,
         memory,
         budgets,
     })
@@ -1111,6 +1153,156 @@ fn measure_snapshot(stages: usize, repeats: usize) -> Result<SnapshotResult, Str
     })
 }
 
+fn measure_read_path(stages: u8, repeats: usize) -> Result<ReadPathResult, String> {
+    let setup = recorder_setup(true, u64::from(stages))?;
+    let operation = Operation::ManualPipeline {
+        stages,
+        frozen: true,
+    };
+    let pattern = Pattern::BucketSpread;
+    // Nonempty earlier counters distinguish a real window from an absolute
+    // snapshot. Neither endpoint spans freeze; the window has online data.
+    run_checkpoints(operation, pattern, 65, Some(&setup));
+    let earlier = setup.tracegrams.snapshot_relaxed();
+    run_checkpoints(operation, pattern, 4097, Some(&setup));
+    let config = DiagnoseConfig::experimental_defaults();
+    let mut raw: [Vec<u128>; 4] = std::array::from_fn(|_| Vec::with_capacity(repeats));
+    let mut stage_validation = Vec::new();
+    for repeat in 0..repeats + 3 {
+        // Only the harness's result buffer is preallocated. API-owned
+        // snapshots, deltas and diagnosis reports allocate inside timing.
+        let mut reports = Vec::with_capacity(usize::from(stages));
+        let started = Instant::now();
+        let snapshot = black_box(&setup.tracegrams).snapshot_relaxed();
+        let scanned = Instant::now();
+        let delta = black_box(&snapshot)
+            .delta(black_box(&earlier))
+            .map_err(|error| error.to_string())?;
+        let subtracted = Instant::now();
+        for &stage in &*setup.stages {
+            reports.push(
+                black_box(&delta)
+                    .diagnose(black_box(stage), black_box(&config))
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        black_box(&reports);
+        let finished = Instant::now();
+
+        assert_eq!(delta.diagnostics().total(), 0);
+        stage_validation = validate_stages(&delta, operation, pattern, 4097, 1)?;
+        assert_eq!(reports.len(), usize::from(stages));
+        for (index, report) in reports.iter().enumerate() {
+            let predecessor = if index == 0 { 0 } else { 4097 };
+            assert_eq!(report.stage(), setup.stages[index]);
+            assert_eq!(report.matrix_derived().cause_samples, predecessor);
+            assert_eq!(report.matrix_derived().incoming_samples, predecessor);
+            assert_eq!(report.calibrated_online().predecessor_samples, predecessor);
+            assert_eq!(report.calibrated_online().first_samples, 4097 - predecessor);
+        }
+        if repeat >= 3 {
+            for (samples, elapsed) in raw.iter_mut().zip([
+                scanned.duration_since(started),
+                subtracted.duration_since(scanned),
+                finished.duration_since(subtracted),
+                finished.duration_since(started),
+            ]) {
+                samples.push(elapsed.as_nanos());
+            }
+        }
+    }
+    let mut timings = ["snapshot-frozen", "delta", "diagnose-all", "read-cycle"]
+        .into_iter()
+        .zip(raw)
+        .map(|(name, samples)| ReadTiming::new(name, samples))
+        .collect::<Vec<_>>();
+    for ready in [true, false] {
+        timings.push(measure_freeze(usize::from(stages), ready, repeats)?);
+    }
+    Ok(ReadPathResult {
+        stages: usize::from(stages),
+        timings,
+        stage_validation,
+    })
+}
+
+fn measure_freeze(stages: usize, ready: bool, repeats: usize) -> Result<ReadTiming, String> {
+    let mut raw = Vec::with_capacity(repeats);
+    for repeat in 0..repeats + 3 {
+        // A successful freeze is one-shot. Reusing a frozen recorder would
+        // silently benchmark AlreadyFrozen instead of threshold publication.
+        let (tracegrams, stage_ids) = build_recorder(stages)?;
+        for request in 0..2 {
+            let mut context = tracegrams.start_manual();
+            for (index, &stage) in stage_ids.iter().enumerate() {
+                if ready || request == 0 || index + 1 < stages {
+                    tracegrams.record_elapsed(
+                        &mut context,
+                        stage,
+                        Duration::from_nanos(HOT_DURATION_NS),
+                    );
+                }
+            }
+        }
+        let started = Instant::now();
+        let result = black_box(&tracegrams).try_freeze_calibration(black_box(2));
+        black_box(&result);
+        let elapsed = started.elapsed().as_nanos();
+
+        let snapshot = tracegrams.snapshot_relaxed();
+        assert_eq!(snapshot.diagnostics().total(), 0);
+        if ready {
+            let report = result.map_err(|error| error.to_string())?;
+            assert_eq!(snapshot.calibration_state(), CalibrationState::Frozen);
+            assert_eq!(snapshot.calibration_report(), Some(&report));
+            assert_eq!(report.stages.len(), stages);
+            for (index, entry) in report.stages.iter().enumerate() {
+                assert_eq!(entry.stage, stage_ids[index]);
+                for population in [
+                    entry.local,
+                    entry.cumulative_after,
+                    entry.previous_cumulative,
+                ] {
+                    let absent = index == 0
+                        && population.population == CalibrationPopulation::PreviousCumulative;
+                    assert_eq!(population.samples, if absent { 0 } else { 2 });
+                    assert_eq!(
+                        population.availability(),
+                        if absent {
+                            CalibrationThresholdAvailability::AbsentNoPredecessor
+                        } else {
+                            CalibrationThresholdAvailability::Available
+                        }
+                    );
+                }
+            }
+        } else {
+            assert_eq!(
+                result,
+                Err(FreezeError::NotReady {
+                    stage: stage_ids[stages - 1],
+                    population: CalibrationPopulation::Local,
+                    samples: 1,
+                    minimum: 2,
+                })
+            );
+            assert_eq!(snapshot.calibration_state(), CalibrationState::Collecting);
+            assert!(snapshot.calibration_report().is_none());
+        }
+        if repeat >= 3 {
+            raw.push(elapsed);
+        }
+    }
+    Ok(ReadTiming::new(
+        if ready {
+            "freeze-success"
+        } else {
+            "freeze-not-ready"
+        },
+        raw,
+    ))
+}
+
 fn measure_memory(stages: usize) -> Result<MemoryResult, String> {
     let (tracegrams, _) = build_recorder(stages)?;
     let snapshot = tracegrams.snapshot_relaxed();
@@ -1354,6 +1546,17 @@ fn print_summary(report: &ScreeningReport) {
             snapshot.median_absolute_deviation_ns,
             snapshot.exact_estimated_bytes
         );
+    }
+    for read_path in &report.read_paths {
+        for timing in &read_path.timings {
+            println!(
+                "read/control {:>2} stages {:<18}: median {:.0} ns, MAD {:.0} ns (ungated)",
+                read_path.stages,
+                timing.operation,
+                timing.median_ns,
+                timing.median_absolute_deviation_ns
+            );
+        }
     }
     println!();
     for budget in &report.budgets {
