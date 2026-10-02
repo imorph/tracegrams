@@ -233,10 +233,9 @@ fn derive_matrix_scores(
         (Some(previous), Some(local)) => {
             cause_scores(cause, previous.bucket, local.bucket, tail_onset)
         }
-        _ => Scores {
-            tail_onset,
-            ..Scores::all(Score::unavailable(ScoreStatus::NoPredecessorPopulation))
-        },
+        // Both cause marginals have the same population. If empty, neither
+        // has a rank, so tail_onset is also NoPredecessorPopulation.
+        _ => Scores::all(Score::unavailable(ScoreStatus::NoPredecessorPopulation)),
     };
 
     MatrixScores {
@@ -809,6 +808,37 @@ mod tests {
 
     use super::*;
     use crate::Tracegrams;
+
+    #[test]
+    fn empty_cause_does_not_invent_scores_from_relaxed_incoming() {
+        let mut builder = Tracegrams::builder();
+        builder.stage("first").unwrap();
+        let destination = builder.stage("destination").unwrap();
+        // A relaxed scan can see incoming cells updated after it scanned
+        // the still-empty cause matrix. Neither cause marginal has a rank.
+        let cause = vec![0; BUCKETS * BUCKETS];
+        let mut incoming = vec![0; BUCKETS * BUCKETS];
+        incoming[2 * BUCKETS + 11] = 5;
+        let matrix = derive_matrix_scores(destination, 0.9, &cause, Some(&incoming));
+        assert_eq!(matrix.cause_samples, 0);
+        assert_eq!(matrix.incoming_samples, 5);
+        assert_eq!(matrix.thresholds.local, None);
+        assert_eq!(matrix.thresholds.previous_cumulative, None);
+        assert_eq!(matrix.thresholds.cumulative_after.unwrap().bucket, 11);
+        for score in [
+            matrix.scores.tail_onset,
+            matrix.scores.local_tail_origin_clean,
+            matrix.scores.local_tail_origin_tail,
+            matrix.scores.local_tail_rate_given_prev_tail,
+            matrix.scores.local_tail_rate_given_prev_not_tail,
+            matrix.scores.amplification_lift,
+            matrix.scores.carry_through,
+        ] {
+            assert_eq!(score.status(), ScoreStatus::NoPredecessorPopulation);
+            assert_eq!((score.numerator(), score.denominator()), (0, 0));
+            assert_eq!(score.value(), None);
+        }
+    }
 
     #[test]
     fn all_twelve_online_truth_cells_feed_the_exact_formula_terms() {

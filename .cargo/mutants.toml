@@ -6,11 +6,6 @@ exclude_re = [
   'replace \| with \^ in quantile_rank$',
   # Strictly increasing bucket bounds make lower == upper unreachable.
   'replace < with <= in relative_error$',
-  # The fallback already sets every score to NoPredecessorPopulation.
-  # cargo-mutants 27.1.0 ignores this field-deletion filter (upstream #632):
-  # https://github.com/sourcefrog/cargo-mutants/issues/632
-  # Keep the narrow rule for the fix; do not exclude the whole function.
-  'delete field tail_onset from struct Scores expression in derive_matrix_scores$',
   # For predecessor cells c >= 4, (c - 4) & 4 == (c + 4) & 4.
   'replace - with \+ in online_totals$',
   # Complementing both frozen predicates preserves their inequality.
