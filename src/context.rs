@@ -505,6 +505,11 @@ impl Tracegrams {
 
         match self.inner.calibration_state.load(Ordering::Acquire) {
             CALIBRATION_COLLECTING => {
+                #[cfg(test)]
+                crate::calibration::test_hooks::run(
+                    &crate::calibration::test_hooks::COLLECTING_MARK,
+                );
+
                 let calibration_local = calibration_bucketize(local_ns, local_bucket);
                 let calibration_after = if previous.is_none() {
                     calibration_local

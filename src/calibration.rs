@@ -216,6 +216,9 @@ impl Tracegrams {
             return Err(error);
         }
 
+        #[cfg(test)]
+        test_hooks::run(&test_hooks::BEFORE_CLAIM);
+
         if let Err(observed) = self.inner.calibration_state.compare_exchange(
             CALIBRATION_COLLECTING,
             CALIBRATION_FREEZING,
@@ -263,6 +266,9 @@ impl Tracegrams {
         // Online cells are written only in the frozen state, so they are still
         // zero here. Publish thresholds before the release store below exposes
         // the frozen state.
+        #[cfg(test)]
+        test_hooks::run(&test_hooks::BEFORE_PUBLISH);
+
         for report in &stage_reports {
             let published = FrozenStageCalibration { report: *report };
             self.inner.frozen_calibration[report.stage.index()]
@@ -410,12 +416,268 @@ fn first_terminal(
     })
 }
 
+// One-shot, thread-local hooks cannot suspend an unrelated parallel test or
+// survive their worker thread. No hook storage or calls exist outside unit tests.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+    use std::thread::LocalKey;
+
+    pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
+
+    thread_local! {
+        pub(crate) static BEFORE_CLAIM: Hook = RefCell::new(None);
+        pub(crate) static BEFORE_PUBLISH: Hook = RefCell::new(None);
+        pub(crate) static COLLECTING_MARK: Hook = RefCell::new(None);
+    }
+
+    pub(crate) fn run(hook: &'static LocalKey<Hook>) {
+        let callback = hook.take();
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread::{self, JoinHandle, LocalKey};
     use std::time::Duration;
 
     use super::*;
-    use crate::bucket::bucketize;
+    use crate::{CalibrationState, Outcome};
+
+    // Channels (rather than sleeps) select the interleaving. Disconnection or
+    // a timeout turns a broken branch into a failure instead of a hung suite.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    struct Pause {
+        reached: Receiver<()>,
+        resume: Sender<()>,
+    }
+
+    fn paused_at<T: Send + 'static>(
+        hook: &'static LocalKey<test_hooks::Hook>,
+        action: impl FnOnce() -> T + Send + 'static,
+    ) -> (Pause, JoinHandle<T>) {
+        let (reached_tx, reached) = mpsc::channel();
+        let (resume, resume_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            hook.set(Some(Box::new(move || {
+                reached_tx.send(()).unwrap();
+                resume_rx.recv_timeout(WAIT).unwrap();
+            })));
+            action()
+        });
+        (Pause { reached, resume }, worker)
+    }
+
+    fn warmed_pair() -> (Tracegrams, StageId, StageId) {
+        let mut builder = Tracegrams::builder();
+        let first = builder.stage("first").unwrap();
+        let second = builder.stage("second").unwrap();
+        let tracegrams = builder.build().unwrap();
+        record_pair(&tracegrams, first, second);
+        (tracegrams, first, second)
+    }
+
+    fn record_pair(tracegrams: &Tracegrams, first: StageId, second: StageId) {
+        let mut context = tracegrams.start_manual();
+        tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
+        tracegrams.finish_manual(context, second, Duration::from_nanos(200), Outcome::Success);
+    }
+
+    #[test]
+    fn losing_freezer_observes_frozen_at_compare_exchange() {
+        let (tracegrams, _, _) = warmed_pair();
+        let loser_recorder = tracegrams.clone();
+        let (pause, loser) = paused_at(&test_hooks::BEFORE_CLAIM, move || {
+            loser_recorder.try_freeze_calibration(1)
+        });
+        pause.reached.recv_timeout(WAIT).unwrap();
+        let report = tracegrams.try_freeze_calibration(1).unwrap();
+        pause.resume.send(()).unwrap();
+        assert_eq!(loser.join().unwrap(), Err(FreezeError::AlreadyFrozen));
+        assert_eq!(
+            tracegrams.snapshot_relaxed().calibration_report(),
+            Some(&report)
+        );
+    }
+
+    #[test]
+    fn competing_freezers_observe_freezing_at_load_and_compare_exchange() {
+        let (tracegrams, _, _) = warmed_pair();
+        let loser_recorder = tracegrams.clone();
+        let (loser_pause, loser) = paused_at(&test_hooks::BEFORE_CLAIM, move || {
+            loser_recorder.try_freeze_calibration(1)
+        });
+        loser_pause.reached.recv_timeout(WAIT).unwrap();
+
+        let winner_recorder = tracegrams.clone();
+        let (winner_pause, winner) = paused_at(&test_hooks::BEFORE_PUBLISH, move || {
+            winner_recorder.try_freeze_calibration(1)
+        });
+        winner_pause.reached.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            tracegrams.try_freeze_calibration(1),
+            Err(FreezeError::AlreadyFreezing)
+        );
+        loser_pause.resume.send(()).unwrap();
+        assert_eq!(loser.join().unwrap(), Err(FreezeError::AlreadyFreezing));
+
+        let snapshot = tracegrams.snapshot_relaxed();
+        assert_eq!(snapshot.calibration_state(), CalibrationState::Freezing);
+        assert_eq!(snapshot.calibration_report(), None);
+        winner_pause.resume.send(()).unwrap();
+        let report = winner.join().unwrap().unwrap();
+        assert_eq!(
+            tracegrams.snapshot_relaxed().calibration_report(),
+            Some(&report)
+        );
+    }
+
+    #[test]
+    fn collecting_writer_can_increment_after_the_freeze_scan_and_publication() {
+        let (tracegrams, first, second) = warmed_pair();
+        let mut context = tracegrams.start_manual();
+        tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(100));
+        let writer_recorder = tracegrams.clone();
+        let (pause, writer) = paused_at(&test_hooks::COLLECTING_MARK, move || {
+            writer_recorder.finish_manual(
+                context,
+                second,
+                Duration::from_nanos(200),
+                Outcome::Error,
+            );
+        });
+        pause.reached.recv_timeout(WAIT).unwrap();
+        let report = tracegrams.try_freeze_calibration(1).unwrap();
+        let scanned = report.stage(second).unwrap();
+        assert_eq!(scanned.local.samples, 1);
+        assert_eq!(scanned.cumulative_after.samples, 1);
+        assert_eq!(scanned.previous_cumulative.samples, 1);
+
+        pause.resume.send(()).unwrap();
+        writer.join().unwrap();
+        let snapshot = tracegrams.snapshot_relaxed();
+        let counts = snapshot.sample_counts(second).unwrap();
+        assert_eq!(counts.local, 2);
+        assert_eq!(counts.cumulative_after, 2);
+        assert_eq!(counts.cause, 2);
+        assert_eq!(counts.incoming, 2);
+        assert_eq!(counts.calibration_local, 2);
+        assert_eq!(counts.calibration_cumulative_after, 2);
+        assert_eq!(counts.calibration_previous_cumulative, 2);
+        assert_eq!(counts.online, 0);
+        assert_eq!(snapshot.completion_counts(second).unwrap().success, 1);
+        assert_eq!(snapshot.completion_counts(second).unwrap().error, 1);
+        assert_eq!(snapshot.diagnostics().total(), 0);
+        // Freeze reports retain their relaxed scan, not subsequent increments.
+        assert_eq!(snapshot.calibration_report(), Some(&report));
+    }
+
+    #[test]
+    fn writers_during_publication_keep_matrices_but_not_calibration_or_online() {
+        let (tracegrams, first, second) = warmed_pair();
+        let freezer_recorder = tracegrams.clone();
+        let (pause, freezer) = paused_at(&test_hooks::BEFORE_PUBLISH, move || {
+            freezer_recorder.try_freeze_calibration(1)
+        });
+        pause.reached.recv_timeout(WAIT).unwrap();
+        let before = tracegrams.snapshot_relaxed();
+        assert_eq!(before.calibration_state(), CalibrationState::Freezing);
+        assert_eq!(before.calibration_report(), None);
+
+        // Both kinds of context start during Freezing. Their predecessor mark
+        // runs before publication and their finish runs after publication.
+        tracegrams.inner.clock_readings.lock().unwrap().extend([
+            (0, false),
+            (100, false),
+            (300, false),
+            (400, false),
+            (500, false),
+            (700, false),
+        ]);
+        let mut manual = tracegrams.start_manual();
+        let mut clocked = tracegrams.start();
+        tracegrams.record_elapsed(&mut manual, first, Duration::from_nanos(100));
+        tracegrams.mark(&mut clocked, first);
+        record_pair(&tracegrams, first, second);
+        let during = tracegrams.snapshot_relaxed();
+        assert_eq!(during.calibration_state(), CalibrationState::Freezing);
+        assert_eq!(during.calibration_report(), None);
+        assert_eq!(
+            during
+                .diagnostics()
+                .calibration_samples_skipped_while_freezing,
+            4
+        );
+        assert_eq!(during.completion_counts(second).unwrap().success, 2);
+        for stage in [first, second] {
+            let counts = during.sample_counts(stage).unwrap();
+            let old = before.sample_counts(stage).unwrap();
+            assert_eq!(counts.calibration_local, old.calibration_local);
+            assert_eq!(
+                counts.calibration_cumulative_after,
+                old.calibration_cumulative_after
+            );
+            assert_eq!(
+                counts.calibration_previous_cumulative,
+                old.calibration_previous_cumulative
+            );
+            assert_eq!(counts.online, 0);
+        }
+        assert_eq!(during.sample_counts(first).unwrap().local, 4);
+        assert_eq!(during.sample_counts(second).unwrap().cause, 2);
+        assert_eq!(during.sample_counts(second).unwrap().incoming, 2);
+
+        pause.resume.send(()).unwrap();
+        let report = freezer.join().unwrap().unwrap();
+        tracegrams.finish_manual(manual, second, Duration::from_nanos(200), Outcome::Error);
+        tracegrams.finish(clocked, second, Outcome::Error);
+        let crossed = tracegrams.snapshot_relaxed();
+        for stage in [first, second] {
+            assert_eq!(crossed.sample_counts(stage).unwrap().online, 0);
+        }
+
+        // Fresh manual and clocked contexts see every published threshold.
+        record_pair(&tracegrams, first, second);
+        let mut clocked = tracegrams.start();
+        tracegrams.mark(&mut clocked, first);
+        tracegrams.finish(clocked, second, Outcome::Success);
+        let after = tracegrams.snapshot_relaxed();
+        assert_eq!(after.calibration_state(), CalibrationState::Frozen);
+        assert_eq!(after.calibration_report(), Some(&report));
+        for stage in [first, second] {
+            let counts = after.sample_counts(stage).unwrap();
+            assert_eq!(counts.local, 6);
+            assert_eq!(counts.cumulative_after, 6);
+            assert_eq!(counts.calibration_local, 1);
+            assert_eq!(counts.calibration_cumulative_after, 1);
+            assert_eq!(counts.online, 2);
+        }
+        let counts = after.sample_counts(second).unwrap();
+        assert_eq!(counts.cause, 6);
+        assert_eq!(counts.incoming, 6);
+        assert_eq!(counts.calibration_previous_cumulative, 1);
+        assert_eq!(after.completion_counts(second).unwrap().success, 4);
+        assert_eq!(after.completion_counts(second).unwrap().error, 2);
+        assert_eq!(
+            after
+                .diagnostics()
+                .calibration_samples_skipped_while_freezing,
+            4
+        );
+        assert_eq!(
+            after
+                .diagnostics()
+                .online_samples_skipped_missing_previous_threshold,
+            0
+        );
+        assert_eq!(after.diagnostics().total(), 4);
+        assert!(tracegrams.inner.clock_readings.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn revalidation_rejects_an_absent_to_insufficient_previous_population_race() {
@@ -432,25 +694,16 @@ mod tests {
         }
         assert_eq!(first_unready(&tracegrams.scan_calibration(), 2), None);
 
-        tracegrams
-            .inner
-            .calibration_state
-            .store(CALIBRATION_FREEZING, Ordering::Release);
-        let previous_bucket = bucketize(100, calibration_bounds());
-        let previous = tracegrams
-            .inner
-            .layout
-            .segment(
-                destination.index(),
-                Segment::Calibration(CalibrationPopulation::PreviousCumulative),
-            )
-            .unwrap()
-            .start
-            + previous_bucket;
-        tracegrams.inner.increment(previous);
+        let freezer_recorder = tracegrams.clone();
+        let (pause, freezer) = paused_at(&test_hooks::BEFORE_CLAIM, move || {
+            freezer_recorder.try_freeze_calibration(2)
+        });
+        pause.reached.recv_timeout(WAIT).unwrap();
+        record_pair(&tracegrams, first, destination);
+        pause.resume.send(()).unwrap();
 
         assert_eq!(
-            tracegrams.freeze_after_claim(2),
+            freezer.join().unwrap(),
             Err(FreezeError::NotReady {
                 stage: destination,
                 population: CalibrationPopulation::PreviousCumulative,
@@ -468,6 +721,20 @@ mod tests {
                 .frozen_calibration
                 .iter()
                 .all(|published| published.get().is_none())
+        );
+        record_pair(&tracegrams, first, destination);
+        let retry = tracegrams.try_freeze_calibration(2).unwrap();
+        assert_eq!(
+            retry
+                .stage(destination)
+                .unwrap()
+                .previous_cumulative
+                .samples,
+            2
+        );
+        assert_eq!(
+            tracegrams.snapshot_relaxed().calibration_report(),
+            Some(&retry)
         );
     }
 }

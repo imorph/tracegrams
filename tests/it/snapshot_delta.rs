@@ -1,7 +1,7 @@
 //! Relaxed snapshot and pure-delta contract tests.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use tracegrams::{CalibrationPopulation, CalibrationState, DeltaError, Outcome, Tracegrams};
@@ -158,10 +158,15 @@ fn repeated_relaxed_snapshots_are_safe_during_concurrent_writes() {
     let second = builder.stage("second").unwrap();
     let tracegrams = builder.build().unwrap();
     let done = Arc::new(AtomicBool::new(false));
+    let scans = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(2));
     let writer_done = Arc::clone(&done);
+    let writer_scans = Arc::clone(&scans);
+    let writer_start = Arc::clone(&start);
     let writer_tracegrams = tracegrams.clone();
     let writer = std::thread::spawn(move || {
-        for _ in 0..REQUESTS {
+        writer_start.wait();
+        for request in 0..REQUESTS {
             let mut context = writer_tracegrams.start_manual();
             writer_tracegrams.record_elapsed(&mut context, first, Duration::from_nanos(50));
             writer_tracegrams.finish_manual(
@@ -170,11 +175,20 @@ fn repeated_relaxed_snapshots_are_safe_during_concurrent_writes() {
                 Duration::from_nanos(75),
                 Outcome::Success,
             );
+            // Require reader progress at four checkpoints. The writer cannot
+            // finish before the first snapshot or run the whole loop unseen.
+            if (request + 1) % (REQUESTS / 4) == 0 {
+                let before = writer_scans.load(Ordering::Acquire);
+                while writer_scans.load(Ordering::Acquire) == before {
+                    std::thread::yield_now();
+                }
+            }
         }
         writer_done.store(true, Ordering::Release);
     });
 
     let mut previous_first_samples = 0;
+    start.wait();
     while !done.load(Ordering::Acquire) {
         let snapshot = tracegrams.snapshot_relaxed();
         assert_eq!(snapshot.local_counts(first).unwrap().len(), 64);
@@ -183,6 +197,7 @@ fn repeated_relaxed_snapshots_are_safe_during_concurrent_writes() {
         assert!(first_samples >= previous_first_samples);
         assert!(first_samples <= REQUESTS as u128);
         previous_first_samples = first_samples;
+        scans.fetch_add(1, Ordering::Release);
     }
     writer.join().unwrap();
 

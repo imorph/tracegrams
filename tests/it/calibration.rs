@@ -1,12 +1,12 @@
 //! Calibration collection, readiness, and explicit-freeze contract tests.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use tracegrams::{
     CalibrationPopulation, CalibrationState, CalibrationTerminal, CalibrationThresholdAvailability,
-    FreezeError, Tracegrams,
+    FreezeError, Outcome, Tracegrams,
 };
 
 #[test]
@@ -364,21 +364,38 @@ fn concurrent_snapshots_never_observe_a_partial_threshold_bundle() {
     }
 
     let done = Arc::new(AtomicBool::new(false));
+    let scans = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(2));
     let freezer_tracegrams = Arc::clone(&tracegrams);
     let freezer_done = Arc::clone(&done);
+    let freezer_scans = Arc::clone(&scans);
+    let freezer_start = Arc::clone(&start);
     let freezer = std::thread::spawn(move || {
+        freezer_start.wait();
         let report = freezer_tracegrams.try_freeze_calibration(1).unwrap();
+        // Require a snapshot that observes Frozen before ending the reader loop.
+        let before = freezer_scans.load(Ordering::Acquire);
+        while freezer_scans.load(Ordering::Acquire) == before {
+            std::thread::yield_now();
+        }
         freezer_done.store(true, Ordering::Release);
         report
     });
 
+    let collecting = tracegrams.snapshot_relaxed();
+    assert_eq!(collecting.calibration_state(), CalibrationState::Collecting);
+    assert_eq!(collecting.calibration_report(), None);
+    start.wait();
     while !done.load(Ordering::Acquire) {
         let snapshot = tracegrams.snapshot_relaxed();
         match snapshot.calibration_state() {
             CalibrationState::Collecting | CalibrationState::Freezing => {
                 assert_eq!(snapshot.calibration_report(), None);
             }
-            CalibrationState::Frozen => assert_complete_bundle(&snapshot, stages.len()),
+            CalibrationState::Frozen => {
+                assert_complete_bundle(&snapshot, stages.len());
+                scans.fetch_add(1, Ordering::Release);
+            }
             _ => unreachable!("calibration state is non-exhaustive"),
         }
     }
@@ -386,6 +403,127 @@ fn concurrent_snapshots_never_observe_a_partial_threshold_bundle() {
     let frozen = tracegrams.snapshot_relaxed();
     assert_complete_bundle(&frozen, stages.len());
     assert_eq!(frozen.calibration_report(), Some(&returned));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the raced workload and its accounting together.
+fn concurrent_writers_and_freezer_account_for_known_context_populations() {
+    const WRITERS: usize = 4;
+    const RACING: usize = 512;
+    const ONLINE: usize = 128;
+    let mut builder = Tracegrams::builder();
+    let first = builder.stage("first").unwrap();
+    let second = builder.stage("second").unwrap();
+    let last = builder
+        .stage("last-without-calibrated-predecessor")
+        .unwrap();
+    let tracegrams = builder.build().unwrap();
+    let mut warmup = tracegrams.start_manual();
+    tracegrams.record_elapsed(&mut warmup, first, Duration::from_nanos(100));
+    tracegrams.finish_manual(warmup, second, Duration::from_nanos(200), Outcome::Success);
+    tracegrams.finish_manual(
+        tracegrams.start_manual(),
+        last,
+        Duration::from_nanos(300),
+        Outcome::Error,
+    );
+
+    let start = Arc::new(Barrier::new(WRITERS + 1));
+    let frozen = Arc::new(Barrier::new(WRITERS + 1));
+    let mut writers = Vec::new();
+    for _ in 0..WRITERS {
+        let recorder = tracegrams.clone();
+        let start = Arc::clone(&start);
+        let frozen = Arc::clone(&frozen);
+        writers.push(std::thread::spawn(move || {
+            // Every racing context starts before the freezer is released.
+            let contexts = (0..RACING)
+                .map(|_| recorder.start_manual())
+                .collect::<Vec<_>>();
+            start.wait();
+            for mut context in contexts {
+                recorder.record_elapsed(&mut context, first, Duration::from_nanos(150));
+                recorder.finish_manual(context, second, Duration::from_nanos(250), Outcome::Error);
+            }
+            frozen.wait();
+            for _ in 0..ONLINE {
+                let mut context = recorder.start_manual();
+                recorder.record_elapsed(&mut context, first, Duration::from_nanos(150));
+                recorder.record_elapsed(&mut context, second, Duration::from_nanos(250));
+                recorder.finish_manual(context, last, Duration::from_nanos(350), Outcome::Success);
+            }
+        }));
+    }
+    start.wait();
+    tracegrams.try_freeze_calibration(1).unwrap();
+    frozen.wait();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    // Read final counters after join, not the approximately coincident scan
+    // in FreezeReport. Pre-publication contexts intentionally have no online
+    // samples; missing-previous-threshold skips are a separate population.
+    let snapshot = tracegrams.snapshot_relaxed();
+    let racing = (WRITERS * RACING) as u128;
+    let online = (WRITERS * ONLINE) as u128;
+    let mut calibration_marks = 0;
+    for stage in [first, second] {
+        let counts = snapshot.sample_counts(stage).unwrap();
+        assert_eq!(counts.local, 1 + racing + online);
+        assert_eq!(counts.cumulative_after, counts.local);
+        assert!((1..=1 + racing).contains(&counts.calibration_local));
+        assert_eq!(
+            counts.calibration_cumulative_after,
+            counts.calibration_local
+        );
+        assert_eq!(counts.online, online);
+        calibration_marks += counts.calibration_local - 1;
+    }
+    let second_counts = snapshot.sample_counts(second).unwrap();
+    assert_eq!(second_counts.cause, 1 + racing + online);
+    assert_eq!(second_counts.incoming, second_counts.cause);
+    assert_eq!(
+        second_counts.calibration_previous_cumulative,
+        second_counts.calibration_local
+    );
+    assert_eq!(
+        snapshot
+            .sample_counts(first)
+            .unwrap()
+            .calibration_previous_cumulative,
+        0
+    );
+    let last_counts = snapshot.sample_counts(last).unwrap();
+    assert_eq!(last_counts.local, 1 + online);
+    assert_eq!(last_counts.cumulative_after, 1 + online);
+    assert_eq!(last_counts.cause, online);
+    assert_eq!(last_counts.incoming, online);
+    assert_eq!(last_counts.calibration_local, 1);
+    assert_eq!(last_counts.calibration_cumulative_after, 1);
+    assert_eq!(last_counts.calibration_previous_cumulative, 0);
+    assert_eq!(last_counts.online, 0);
+    assert_eq!(snapshot.completion_counts(first).unwrap().success, 0);
+    assert_eq!(snapshot.completion_counts(first).unwrap().error, 0);
+    assert_eq!(snapshot.completion_counts(second).unwrap().success, 1);
+    assert_eq!(
+        u128::from(snapshot.completion_counts(second).unwrap().error),
+        racing
+    );
+    assert_eq!(
+        u128::from(snapshot.completion_counts(last).unwrap().success),
+        online
+    );
+    assert_eq!(snapshot.completion_counts(last).unwrap().error, 1);
+    let diagnostics = snapshot.diagnostics();
+    let skipped = u128::from(diagnostics.calibration_samples_skipped_while_freezing);
+    // The remainder consists of pre-freeze contexts recording in Frozen.
+    assert!(calibration_marks + skipped <= 2 * racing);
+    assert_eq!(
+        u128::from(diagnostics.online_samples_skipped_missing_previous_threshold),
+        online
+    );
+    assert_eq!(diagnostics.total(), skipped + online);
 }
 
 fn assert_complete_bundle(snapshot: &tracegrams::Snapshot, expected_stages: usize) {
