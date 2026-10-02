@@ -547,8 +547,8 @@ fn relative_error(lower: u64, upper: u64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{rank as rational_rank, runner};
     use proptest::prelude::*;
-    use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 
     const EXPECTED_DEFAULT_BOUNDS: [u64; BUCKETS - 1] =
         include!("../tests/fixtures/default_bounds.rs");
@@ -595,29 +595,6 @@ mod tests {
         ]
     }
 
-    // Derive the exact binary rational without decoding the IEEE-754 fields,
-    // then apply `ceil(samples * numerator / 2^denominator_power)`.
-    fn rational_rank(samples: u64, quantile: f64) -> u128 {
-        let mut numerator = quantile;
-        let mut denominator_power = 0_u32;
-        while numerator.fract() != 0.0 {
-            numerator *= 2.0;
-            denominator_power += 1;
-        }
-
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let numerator = numerator as u64;
-        let product = u128::from(samples) * u128::from(numerator);
-        let rank = if denominator_power >= u128::BITS - product.leading_zeros() {
-            1
-        } else {
-            let quotient = product >> denominator_power;
-            let remainder_mask = (1_u128 << denominator_power) - 1;
-            quotient + u128::from(product & remainder_mask != 0)
-        };
-        rank.clamp(1, u128::from(samples))
-    }
-
     fn assert_rank_case(counts: &[u64], quantile: f64) -> Result<BucketThreshold, TestCaseError> {
         let samples = counts.iter().copied().sum::<u64>();
         let selection = nearest_rank(counts, quantile).unwrap();
@@ -661,17 +638,7 @@ mod tests {
 
     #[test]
     fn nearest_rank_matches_exact_rational_oracle_and_is_monotonic() {
-        let config = Config {
-            cases: 256,
-            failure_persistence: Some(Box::new(
-                proptest::test_runner::FileFailurePersistence::Direct(
-                    "proptest-regressions/bucket.txt",
-                ),
-            )),
-            ..Config::default()
-        };
-        let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[0x5a; 32]);
-        let mut runner = TestRunner::new_with_rng(config, rng);
+        let mut runner = runner(256, 0x5a, "proptest-regressions/bucket.txt");
         let strategy = (counts_strategy(), quantile_strategy(), quantile_strategy());
 
         runner

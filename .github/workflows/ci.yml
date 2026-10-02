@@ -49,6 +49,7 @@ jobs:
         with: { toolchain: stable }
       - run: cargo test --locked --all-features --release --test it recorder_state_machine_matches_independent_model
       - run: cargo test --locked --all-features --release --test it diagnosis_scores_match_raw_event_oracle
+      - run: cargo test --locked --all-features --release --lib clocked_sequences_match_manual_across_freeze
 
   mutants-diff:
     if: github.event_name == 'pull_request' || github.event_name == 'push'

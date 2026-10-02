@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
+use super::support;
 use proptest::prelude::*;
-use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
 use tracegrams::{
     CalibratedOnlineScores, CalibrationEstimate, CalibrationTerminal, DiagnoseConfig, Outcome,
     Score, ScoreStatus, Snapshot, StageId, Tracegrams,
@@ -58,13 +58,13 @@ fn bucket(value: u64, bounds: &[u64]) -> usize {
     bounds.iter().take_while(|bound| value >= **bound).count()
 }
 
-fn threshold(values: impl Iterator<Item = u64>, bounds: &[u64]) -> usize {
+fn threshold(values: impl Iterator<Item = u64>, bounds: &[u64], quantile: f64) -> usize {
     let mut counts = vec![0_u128; bounds.len() + 1];
     for value in values {
         counts[bucket(value, bounds)] += 1;
     }
     let samples: u128 = counts.iter().sum();
-    let rank = samples.div_ceil(2);
+    let rank = support::rank(u64::try_from(samples).unwrap(), quantile);
     let mut cumulative = 0;
     counts
         .iter()
@@ -199,10 +199,15 @@ fn record(recorder: &Tracegrams, first: StageId, destination: StageId, event: Ev
     );
 }
 
-fn assert_reported_calibration_rank(values: &[u64], bounds: &[u64], estimate: CalibrationEstimate) {
+fn assert_reported_calibration_rank(
+    values: &[u64],
+    bounds: &[u64],
+    estimate: CalibrationEstimate,
+    quantile: f64,
+) -> u64 {
     let samples = values.len() as u128;
-    let rank = samples.div_ceil(2);
-    let selected = threshold(values.iter().copied(), bounds);
+    let rank = support::rank(u64::try_from(samples).unwrap(), quantile);
+    let selected = threshold(values.iter().copied(), bounds, quantile);
     let before = values
         .iter()
         .filter(|value| bucket(**value, bounds) < selected)
@@ -219,11 +224,18 @@ fn assert_reported_calibration_rank(values: &[u64], bounds: &[u64], estimate: Ca
     assert_eq!(estimate.terminal, CalibrationTerminal::Finite);
     assert_eq!(estimate.lower_bound, Some(bounds[selected - 1]));
     assert_eq!(estimate.upper_bound, Some(bounds[selected]));
-    assert_eq!(bucket(estimate.value.unwrap(), bounds), selected);
+    // Independently round 2*lower*upper/(lower+upper) half up, in one
+    // rational expression rather than the production quotient/remainder path.
+    let lower = u128::from(bounds[selected - 1]);
+    let upper = u128::from(bounds[selected]);
+    let expected =
+        u64::try_from((4 * lower * upper + lower + upper) / (2 * (lower + upper))).unwrap();
+    assert_eq!(estimate.value, Some(expected));
+    expected
 }
 
 #[allow(clippy::too_many_lines)]
-fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)>) {
+fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)>, quantile: f64) {
     // All generated values are on the finite grid; these anchors guarantee
     // both first-mark and predecessor-bearing calibration events are
     // represented.
@@ -239,7 +251,7 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
     let mut builder = Tracegrams::builder();
     let first = builder.stage("first").unwrap();
     let destination = builder.stage("destination").unwrap();
-    builder.tail_quantile(QUANTILE).unwrap();
+    builder.tail_quantile(quantile).unwrap();
     let recorder = builder.build().unwrap();
     for event in &calibration {
         record(&recorder, first, destination, *event);
@@ -250,7 +262,7 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
         .snapshot_relaxed()
         .calibration_bucket_bounds()
         .to_vec();
-    for (values, estimate) in [
+    let [local_ns, after_ns, previous_ns] = [
         (
             calibration
                 .iter()
@@ -272,23 +284,10 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
                 .collect::<Vec<_>>(),
             stage_report.previous_cumulative.estimate.unwrap(),
         ),
-    ] {
-        assert_reported_calibration_rank(&values, &calibration_bounds, estimate);
-    }
-
-    let local_ns = stage_report.local.estimate.unwrap().value.unwrap();
-    let previous_ns = stage_report
-        .previous_cumulative
-        .estimate
-        .unwrap()
-        .value
-        .unwrap();
-    let after_ns = stage_report
-        .cumulative_after
-        .estimate
-        .unwrap()
-        .value
-        .unwrap();
+    ]
+    .map(|(values, estimate)| {
+        assert_reported_calibration_rank(&values, &calibration_bounds, estimate, quantile)
+    });
     let mut online = scored
         .into_iter()
         .map(|(has_previous, previous, local)| Event {
@@ -323,9 +322,18 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
     let previous_bucket = threshold(
         all_predecessors.iter().filter_map(|event| event.previous),
         bounds,
+        quantile,
     );
-    let local_bucket = threshold(all_predecessors.iter().map(|event| event.local), bounds);
-    let after_bucket = threshold(all_predecessors.iter().map(|event| event.after()), bounds);
+    let local_bucket = threshold(
+        all_predecessors.iter().map(|event| event.local),
+        bounds,
+        quantile,
+    );
+    let after_bucket = threshold(
+        all_predecessors.iter().map(|event| event.after()),
+        bounds,
+        quantile,
+    );
     let matrix_expected = expected_scores(
         &all_predecessors,
         |value| bucket(value, bounds) >= previous_bucket,
@@ -380,25 +388,18 @@ fn run_case(mut calibration: Vec<(bool, u16, u16)>, scored: Vec<(bool, u16, u16)
 
 #[test]
 fn diagnosis_scores_match_raw_event_oracle() {
-    let config = Config {
-        cases: 64,
-        failure_persistence: Some(Box::new(
-            proptest::test_runner::FileFailurePersistence::Direct(
-                "proptest-regressions/it/diagnosis_properties.txt",
-            ),
-        )),
-        ..Config::default()
-    };
-    let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[0x5c; 32]);
-    let mut runner = TestRunner::new_with_rng(config, rng);
+    let mut runner = support::runner(64, 0x5c, "proptest-regressions/it/diagnosis_properties.txt");
     let calibration =
         prop::collection::vec((any::<bool>(), 100_u16..20_000, 100_u16..20_000), 0..=12);
     let scored = prop::collection::vec((any::<bool>(), 0_u16..20_000, 0_u16..20_000), 0..=20);
     runner
-        .run(&(calibration, scored), |(calibration, scored)| {
-            run_case(calibration, scored);
-            Ok(())
-        })
+        .run(
+            &(calibration, scored, support::quantiles()),
+            |(calibration, scored, quantile)| {
+                run_case(calibration, scored, quantile);
+                Ok(())
+            },
+        )
         .unwrap();
 }
 

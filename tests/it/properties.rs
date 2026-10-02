@@ -2,18 +2,24 @@
 
 use std::time::Duration;
 
+use super::support;
 use proptest::prelude::*;
-use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
-use tracegrams::{CalibrationPopulation, CalibrationState, Outcome, Snapshot, StageId, Tracegrams};
+use tracegrams::{
+    CalibrationPopulation, CalibrationState, CalibrationTerminal, DeltaError, DiagnoseConfig,
+    DiagnoseError, FreezeError, ManualCtx, Outcome, Snapshot, StageId, Tracegrams,
+};
 
-const STAGES: usize = 3;
-const WARMUP_REQUESTS: usize = 40;
+const SLOTS: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 enum DurationSpec {
     Zero,
     Small(u16),
-    Boundary { bound: u8, offset: i8 },
+    Boundary {
+        calibration: bool,
+        bound: u8,
+        offset: i8,
+    },
     Max,
     Overflow,
 }
@@ -24,44 +30,141 @@ enum MarkStage {
     Foreign,
 }
 
-#[derive(Clone, Debug)]
-struct Request {
-    foreign_context: bool,
-    marks: Vec<(MarkStage, DurationSpec)>,
-    outcome: Outcome,
+#[derive(Clone, Copy, Debug)]
+enum Operation {
+    Start(usize, usize),
+    Mark(usize, usize, MarkStage, DurationSpec),
+    Finish(usize, usize, MarkStage, DurationSpec, bool),
+    Drop(usize),
+    Snapshot(usize),
+    TryFreeze(usize, u64),
+    Delta(usize, usize),
+    Diagnose(usize, MarkStage),
 }
 
 fn duration_strategy() -> impl Strategy<Value = DurationSpec> {
     prop_oneof![
         2 => Just(DurationSpec::Zero),
         8 => any::<u16>().prop_map(DurationSpec::Small),
-        8 => (0_u8..63, -1_i8..=1).prop_map(|(bound, offset)| DurationSpec::Boundary { bound, offset }),
+        8 => (any::<bool>(), any::<u8>(), -1_i8..=1).prop_map(|(calibration, bound, offset)| DurationSpec::Boundary { calibration, bound, offset }),
         1 => Just(DurationSpec::Max),
         1 => Just(DurationSpec::Overflow),
     ]
 }
 
-fn stage_strategy() -> impl Strategy<Value = MarkStage> {
+fn stage_strategy(stages: u8) -> impl Strategy<Value = MarkStage> {
     prop_oneof![
-        9 => (0_u8..3).prop_map(MarkStage::Registered),
+        9 => (0_u8..stages).prop_map(MarkStage::Registered),
         1 => Just(MarkStage::Foreign),
     ]
 }
 
-fn request_strategy() -> impl Strategy<Value = Request> {
-    (
-        proptest::bool::weighted(0.08),
-        prop::collection::vec((stage_strategy(), duration_strategy()), 1..=6),
-        any::<bool>(),
+fn random_operations(stages: u8) -> impl Strategy<Value = Vec<Operation>> {
+    prop::collection::vec(
+        prop_oneof![
+            3 => (0..SLOTS, 0..2_usize).prop_map(|(s, r)| Operation::Start(s, r)),
+            5 => (0..SLOTS, 0..2_usize, stage_strategy(stages), duration_strategy()).prop_map(|(s,r,t,d)| Operation::Mark(s,r,t,d)),
+            3 => (0..SLOTS, 0..2_usize, stage_strategy(stages), duration_strategy(), any::<bool>()).prop_map(|(s,r,t,d,e)| Operation::Finish(s,r,t,d,e)),
+            1 => (0..SLOTS).prop_map(Operation::Drop),
+            2 => (0..2_usize).prop_map(Operation::Snapshot),
+            2 => (0..2_usize, 0..=6_u64).prop_map(|(r,n)| Operation::TryFreeze(r,n)),
+            2 => (0..8_usize, 0..8_usize).prop_map(|(i,j)| Operation::Delta(i,j)),
+            2 => (0..2_usize, stage_strategy(stages)).prop_map(|(r,t)| Operation::Diagnose(r,t)),
+        ],
+        0..=64,
     )
-        .prop_map(|(foreign_context, marks, error)| Request {
-            foreign_context,
-            marks,
-            outcome: if error {
-                Outcome::Error
-            } else {
-                Outcome::Success
-            },
+}
+
+// Interleave four valid increasing paths, rather than spending most generated
+// calls rejecting empty slots, repeated stages or foreign contexts.
+fn valid_operations(stages: u8) -> impl Strategy<Value = Vec<Operation>> {
+    prop::collection::vec(
+        (
+            0..2_usize,
+            prop::collection::btree_set(0..stages, 1..=usize::from(stages)),
+            prop::collection::vec(duration_strategy(), usize::from(stages)),
+            any::<bool>(),
+        ),
+        SLOTS,
+    )
+    .prop_map(move |paths| {
+        let mut ops = (0..SLOTS)
+            .map(|s| Operation::Start(s, paths[s].0))
+            .collect::<Vec<_>>();
+        for step in 0..usize::from(stages) {
+            for (slot, (owner, path, durations, error)) in paths.iter().enumerate() {
+                if let Some(stage) = path.iter().nth(step) {
+                    let mark = MarkStage::Registered(*stage);
+                    ops.push(if step + 1 == path.len() {
+                        Operation::Finish(slot, *owner, mark, durations[step], *error)
+                    } else {
+                        Operation::Mark(slot, *owner, mark, durations[step])
+                    });
+                }
+            }
+            ops.extend([Operation::Snapshot(0), Operation::TryFreeze(step % 2, 1)]);
+        }
+        ops
+    })
+}
+
+fn sequence_strategy(stages: u8) -> impl Strategy<Value = Vec<Operation>> {
+    (
+        1..=3_u64,
+        prop_oneof![3 => (100_u16..500).prop_map(DurationSpec::Small),
+         1 => Just(DurationSpec::Small(50)), 1 => Just(DurationSpec::Max)],
+        any::<bool>(),
+        0..=4_u64,
+        prop_oneof![valid_operations(stages), random_operations(stages)],
+    )
+        .prop_map(move |(samples, duration, first_only, minimum, traffic)| {
+            let mut ops = Vec::new();
+            for owner in 0..2 {
+                ops.extend([
+                    Operation::Snapshot(owner),
+                    Operation::TryFreeze(owner, minimum),
+                ]);
+                for _ in 0..samples {
+                    ops.push(Operation::Start(0, owner));
+                    for stage in 0..stages {
+                        if first_only {
+                            ops.push(Operation::Start(0, owner));
+                        }
+                        let stage_id = MarkStage::Registered(stage);
+                        ops.push(if first_only || stage + 1 == stages {
+                            Operation::Finish(0, owner, stage_id, duration, false)
+                        } else {
+                            Operation::Mark(0, owner, stage_id, duration)
+                        });
+                    }
+                }
+                // Keep a context alive across both the generated attempt and retry.
+                ops.extend([
+                    Operation::Start(owner + 1, owner),
+                    Operation::Snapshot(owner),
+                    Operation::TryFreeze(owner, minimum),
+                    Operation::TryFreeze(owner, 1),
+                    Operation::Finish(
+                        owner + 1,
+                        owner,
+                        MarkStage::Registered(stages - 1),
+                        DurationSpec::Small(300),
+                        true,
+                    ),
+                    Operation::Snapshot(owner),
+                    Operation::Diagnose(owner, MarkStage::Registered(stages - 1)),
+                ]);
+            }
+            // Include valid windows, cross-registry operands, and reverse windows.
+            ops.extend([
+                Operation::Delta(0, 0),
+                Operation::Delta(2, 0),
+                Operation::Delta(0, 2),
+                Operation::Delta(2, 3),
+            ]);
+            ops.extend(traffic);
+            ops.extend([Operation::Delta(7, 0), Operation::Delta(0, 7)]);
+            ops
         })
 }
 
@@ -109,6 +212,7 @@ struct ContextModel {
     started_frozen: bool,
 }
 
+#[derive(Clone)]
 struct Model {
     stages: Vec<StageModel>,
     bounds: Vec<u64>,
@@ -116,12 +220,13 @@ struct Model {
     frozen: bool,
     frozen_previous_threshold: Vec<bool>,
     diagnostics: DiagnosticsModel,
+    quantile: f64,
 }
 
 impl Model {
     fn new(snapshot: &Snapshot) -> Self {
         Self {
-            stages: (0..STAGES)
+            stages: (0..snapshot.stages().len())
                 .map(|_| {
                     StageModel::new(
                         snapshot.bucket_bounds().len() + 1,
@@ -132,8 +237,9 @@ impl Model {
             bounds: snapshot.bucket_bounds().to_vec(),
             calibration_bounds: snapshot.calibration_bucket_bounds().to_vec(),
             frozen: false,
-            frozen_previous_threshold: vec![false; STAGES],
+            frozen_previous_threshold: vec![false; snapshot.stages().len()],
             diagnostics: DiagnosticsModel::default(),
+            quantile: snapshot.tail_quantile(),
         }
     }
 
@@ -240,11 +346,20 @@ impl Model {
     }
 }
 
-fn resolve_duration(spec: DurationSpec, bounds: &[u64]) -> Duration {
+fn resolve_duration(spec: DurationSpec, model: &Model) -> Duration {
     match spec {
         DurationSpec::Zero => Duration::ZERO,
         DurationSpec::Small(value) => Duration::from_nanos(u64::from(value)),
-        DurationSpec::Boundary { bound, offset } => {
+        DurationSpec::Boundary {
+            calibration,
+            bound,
+            offset,
+        } => {
+            let bounds = if calibration {
+                &model.calibration_bounds
+            } else {
+                &model.bounds
+            };
             let bound = bounds[usize::from(bound) % bounds.len()];
             let value = match offset {
                 -1 => bound.saturating_sub(1),
@@ -258,57 +373,214 @@ fn resolve_duration(spec: DurationSpec, bounds: &[u64]) -> Duration {
     }
 }
 
-fn drive_request(
-    recorder: &Tracegrams,
-    foreign: &Tracegrams,
-    stages: &[StageId],
-    foreign_stage: StageId,
-    model: &mut Model,
-    request: &Request,
-) {
-    let owner = if request.foreign_context {
-        foreign
+#[derive(Debug, PartialEq)]
+enum FreezeFailure {
+    Frozen,
+    NotReady(StageId, CalibrationPopulation, u128, u64),
+    Range(StageId, CalibrationPopulation, CalibrationTerminal),
+}
+
+const POPULATIONS: [CalibrationPopulation; 3] = [
+    CalibrationPopulation::Local,
+    CalibrationPopulation::CumulativeAfter,
+    CalibrationPopulation::PreviousCumulative,
+];
+
+fn selected_bucket(counts: &[u64], quantile: f64) -> Option<(usize, u128)> {
+    let samples = counts.iter().sum::<u64>();
+    if samples == 0 {
+        return None;
+    }
+    let rank = support::rank(samples, quantile);
+    let mut remaining = rank;
+    for (index, count) in counts.iter().enumerate() {
+        if remaining <= u128::from(*count) {
+            return Some((index, rank));
+        }
+        remaining -= u128::from(*count);
+    }
+    unreachable!("nonempty population contains the independently computed rank")
+}
+
+fn terminal(bucket: usize, bounds: &[u64]) -> CalibrationTerminal {
+    if bucket == 0 {
+        CalibrationTerminal::Lower
+    } else if bucket == bounds.len() {
+        CalibrationTerminal::Upper
     } else {
-        recorder
-    };
-    let mut actual = Some(owner.start_manual());
-    let mut expected = ContextModel {
-        started_frozen: model.frozen,
-        ..ContextModel::default()
-    };
-    for (index, (stage, duration)) in request.marks.iter().copied().enumerate() {
-        let duration = resolve_duration(duration, &model.bounds);
-        let actual_stage = match stage {
-            MarkStage::Registered(index) => stages[usize::from(index)],
-            MarkStage::Foreign => foreign_stage,
-        };
-        let outcome = (index + 1 == request.marks.len()).then_some(request.outcome);
-        if let Some(outcome) = outcome {
-            recorder.finish_manual(
-                actual.take().expect("a request is finished only once"),
-                actual_stage,
-                duration,
-                outcome,
-            );
-        } else {
-            recorder.record_elapsed(
-                actual
-                    .as_mut()
-                    .expect("unfinished request keeps its context"),
-                actual_stage,
-                duration,
-            );
+        CalibrationTerminal::Finite
+    }
+}
+
+fn expected_freeze(model: &Model, stages: &[StageId], minimum: u64) -> Result<(), FreezeFailure> {
+    if model.frozen {
+        return Err(FreezeFailure::Frozen);
+    }
+    for (stage, counts) in stages.iter().zip(&model.stages) {
+        for (index, population) in POPULATIONS.iter().enumerate() {
+            let samples = counts.calibration[index]
+                .iter()
+                .map(|v| u128::from(*v))
+                .sum::<u128>();
+            if !(index == 2 && samples == 0) && (samples == 0 || samples < u128::from(minimum)) {
+                return Err(FreezeFailure::NotReady(
+                    *stage,
+                    *population,
+                    samples,
+                    minimum,
+                ));
+            }
         }
-        model.mark(
-            &mut expected,
-            request.foreign_context,
+    }
+    for (stage, counts) in stages.iter().zip(&model.stages) {
+        for (index, population) in POPULATIONS.iter().enumerate() {
+            if let Some((bucket, _)) = selected_bucket(&counts.calibration[index], model.quantile) {
+                let terminal = terminal(bucket, &model.calibration_bounds);
+                if terminal != CalibrationTerminal::Finite {
+                    return Err(FreezeFailure::Range(*stage, *population, terminal));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_freeze(recorder: &Tracegrams, stages: &[StageId], model: &mut Model, minimum: u64) {
+    let expected = expected_freeze(model, stages, minimum);
+    let actual = recorder.try_freeze_calibration(minimum);
+    let report = match &actual {
+        Ok(report) | Err(FreezeError::CalibrationRangeInsufficient { report, .. }) => Some(report),
+        _ => None,
+    };
+    if let Some(report) = report {
+        assert_eq!(report.stages.len(), stages.len());
+        for (index, stage) in stages.iter().enumerate() {
+            let reported = report.stage(*stage).unwrap();
+            for (population, counts) in [
+                reported.local,
+                reported.cumulative_after,
+                reported.previous_cumulative,
+            ]
+            .iter()
+            .zip(&model.stages[index].calibration)
+            {
+                assert_eq!(
+                    population.samples,
+                    counts.iter().map(|v| u128::from(*v)).sum::<u128>()
+                );
+                match (population.estimate, selected_bucket(counts, model.quantile)) {
+                    (None, None) => {}
+                    (Some(estimate), Some((bucket, rank))) => {
+                        assert_eq!(estimate.rank, rank);
+                        assert_eq!(estimate.samples, population.samples);
+                        assert_eq!(
+                            estimate.terminal,
+                            terminal(bucket, &model.calibration_bounds)
+                        );
+                    }
+                    pair => panic!("estimate disagrees with population: {pair:?}"),
+                }
+            }
+        }
+    }
+    let actual = actual.map(|_| ()).map_err(|error| match error {
+        FreezeError::AlreadyFrozen => FreezeFailure::Frozen,
+        FreezeError::NotReady {
             stage,
-            duration,
-            outcome,
-        );
-        if outcome.is_some() {
-            break;
+            population,
+            samples,
+            minimum,
+        } => FreezeFailure::NotReady(stage, population, samples, minimum),
+        FreezeError::CalibrationRangeInsufficient {
+            stage,
+            population,
+            terminal,
+            ..
+        } => FreezeFailure::Range(stage, population, terminal),
+        error => panic!("unexpected sequential freeze error: {error:?}"),
+    });
+    assert_eq!(actual, expected);
+    if expected.is_ok() {
+        model.freeze();
+    }
+    assert_snapshot(&recorder.snapshot_relaxed(), stages, model);
+}
+
+impl Model {
+    fn counts_mut(&mut self) -> impl Iterator<Item = &mut u64> {
+        let d = &mut self.diagnostics;
+        self.stages
+            .iter_mut()
+            .flat_map(|s| {
+                s.local
+                    .iter_mut()
+                    .chain(&mut s.cumulative)
+                    .chain(s.cause.iter_mut().flatten())
+                    .chain(s.incoming.iter_mut().flatten())
+                    .chain(s.calibration.iter_mut().flatten())
+                    .chain([&mut s.online, &mut s.success, &mut s.error])
+            })
+            .chain([
+                &mut d.invalid_stage,
+                &mut d.invalid_context,
+                &mut d.non_monotonic,
+                &mut d.latency_overflow,
+                &mut d.cumulative_overflow,
+                &mut d.online_missing_previous_threshold,
+            ])
+    }
+
+    fn delta(&self, earlier: &Self) -> Option<Self> {
+        let mut delta = self.clone();
+        let mut earlier = earlier.clone();
+        for (later, earlier) in delta.counts_mut().zip(earlier.counts_mut()) {
+            *later = later.checked_sub(*earlier)?;
         }
+        Some(delta)
+    }
+}
+
+fn check_diagnosis(snapshot: &Snapshot, stage: StageId, index: Option<usize>, model: &Model) {
+    let config = DiagnoseConfig::experimental_defaults();
+    let actual = snapshot.diagnose(stage, &config);
+    let error = if index.is_none() {
+        Some(DiagnoseError::ForeignStage { stage })
+    } else if snapshot.spans_freeze() {
+        Some(DiagnoseError::WindowSpansFreeze)
+    } else if !model.frozen {
+        Some(DiagnoseError::NotCalibrated { stage })
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        assert_eq!(actual, Err(error));
+    } else {
+        let report = actual.unwrap();
+        let counts = &model.stages[index.unwrap()];
+        assert_eq!(report.stage(), stage);
+        assert_eq!(report.config(), config);
+        assert_eq!(
+            report.calibrated_online().samples(),
+            u128::from(counts.online)
+        );
+        assert_eq!(
+            report.matrix_derived().cause_samples,
+            counts
+                .cause
+                .iter()
+                .flatten()
+                .map(|v| u128::from(*v))
+                .sum::<u128>()
+        );
+        assert_eq!(
+            report.matrix_derived().incoming_samples,
+            counts
+                .incoming
+                .iter()
+                .flatten()
+                .map(|v| u128::from(*v))
+                .sum::<u128>()
+        );
     }
 }
 
@@ -415,87 +687,132 @@ fn assert_sample_counts(samples: tracegrams::SampleCounts, expected: &StageModel
     assert_eq!(samples.online, u128::from(expected.online));
 }
 
-fn run_case(before: &[Request], after: &[Request]) {
-    let mut builder = Tracegrams::builder();
-    let stages = [
-        builder.stage("a").unwrap(),
-        builder.stage("b").unwrap(),
-        builder.stage("c").unwrap(),
-    ];
-    builder.tail_quantile(0.5).unwrap();
-    let recorder = builder.build().unwrap();
-    let mut foreign_builder = Tracegrams::builder();
-    let foreign_stage = foreign_builder.stage("foreign").unwrap();
-    let foreign = foreign_builder.build().unwrap();
-    let mut model = Model::new(&recorder.snapshot_relaxed());
-
-    for _ in 0..WARMUP_REQUESTS {
-        let request = Request {
-            foreign_context: false,
-            marks: vec![
-                (MarkStage::Registered(0), DurationSpec::Small(100)),
-                (MarkStage::Registered(1), DurationSpec::Small(200)),
-                (MarkStage::Registered(2), DurationSpec::Small(300)),
-            ],
-            outcome: Outcome::Success,
-        };
-        drive_request(
-            &recorder,
-            &foreign,
-            &stages,
-            foreign_stage,
-            &mut model,
-            &request,
-        );
+#[allow(clippy::too_many_lines)] // Operation interpreter and its model transitions.
+fn run_case(stage_count: u8, quantile: f64, operations: &[Operation]) {
+    let registries = [(); 2].map(|()| {
+        let mut builder = Tracegrams::builder();
+        builder.tail_quantile(quantile).unwrap();
+        let stages = (0..stage_count)
+            .map(|i| builder.stage(&format!("stage-{i}")).unwrap())
+            .collect::<Vec<_>>();
+        (builder.build().unwrap(), stages)
+    });
+    let mut models = registries
+        .each_ref()
+        .map(|(recorder, _)| Model::new(&recorder.snapshot_relaxed()));
+    let mut contexts: [Option<(usize, ManualCtx, ContextModel)>; SLOTS] =
+        std::array::from_fn(|_| None);
+    let mut history: Vec<(usize, Snapshot, Model)> = Vec::new();
+    let stage_id = |owner: usize, stage: MarkStage| match stage {
+        MarkStage::Registered(i) => registries[owner].1[usize::from(i)],
+        MarkStage::Foreign => registries[1 - owner].1[0],
+    };
+    for operation in operations {
+        match *operation {
+            Operation::Start(slot, owner) => {
+                contexts[slot] = Some((
+                    owner,
+                    registries[owner].0.start_manual(),
+                    ContextModel {
+                        started_frozen: models[owner].frozen,
+                        ..ContextModel::default()
+                    },
+                ));
+            }
+            Operation::Drop(slot) => {
+                contexts[slot] = None;
+            }
+            Operation::Mark(slot, owner, stage, duration)
+            | Operation::Finish(slot, owner, stage, duration, _) => {
+                let Some((context_owner, mut actual, mut expected)) = contexts[slot].take() else {
+                    continue;
+                };
+                let outcome = if let Operation::Finish(_, _, _, _, error) = *operation {
+                    Some(if error {
+                        Outcome::Error
+                    } else {
+                        Outcome::Success
+                    })
+                } else {
+                    None
+                };
+                let duration = resolve_duration(duration, &models[owner]);
+                models[owner].mark(
+                    &mut expected,
+                    context_owner != owner,
+                    stage,
+                    duration,
+                    outcome,
+                );
+                if let Some(outcome) = outcome {
+                    registries[owner].0.finish_manual(
+                        actual,
+                        stage_id(owner, stage),
+                        duration,
+                        outcome,
+                    );
+                } else {
+                    registries[owner].0.record_elapsed(
+                        &mut actual,
+                        stage_id(owner, stage),
+                        duration,
+                    );
+                    contexts[slot] = Some((context_owner, actual, expected));
+                }
+            }
+            Operation::Snapshot(owner) => {
+                let snapshot = registries[owner].0.snapshot_relaxed();
+                assert_snapshot(&snapshot, &registries[owner].1, &models[owner]);
+                if history.len() == 8 {
+                    history.remove(0);
+                }
+                history.push((owner, snapshot, models[owner].clone()));
+            }
+            Operation::TryFreeze(owner, minimum) => check_freeze(
+                &registries[owner].0,
+                &registries[owner].1,
+                &mut models[owner],
+                minimum,
+            ),
+            Operation::Diagnose(owner, stage) => {
+                let index = match stage {
+                    MarkStage::Registered(i) => Some(usize::from(i)),
+                    MarkStage::Foreign => None,
+                };
+                check_diagnosis(
+                    &registries[owner].0.snapshot_relaxed(),
+                    stage_id(owner, stage),
+                    index,
+                    &models[owner],
+                );
+            }
+            Operation::Delta(i, j) if !history.is_empty() => {
+                let (owner, later, expected) = &history[i % history.len()];
+                let (other, earlier, before) = &history[j % history.len()];
+                let actual = later.delta(earlier);
+                if owner != other {
+                    assert!(matches!(actual, Err(DeltaError::RegistryMismatch)));
+                } else if let Some(delta) = expected.delta(before) {
+                    let actual = actual.unwrap();
+                    assert_eq!(actual.spans_freeze(), expected.frozen != before.frozen);
+                    assert_snapshot(&actual, &registries[*owner].1, &delta);
+                    for (index, stage) in registries[*owner].1.iter().enumerate() {
+                        check_diagnosis(&actual, *stage, Some(index), &delta);
+                    }
+                } else {
+                    assert!(matches!(actual, Err(DeltaError::CounterUnderflow { .. })));
+                }
+            }
+            Operation::Delta(..) => {}
+        }
     }
-    for request in before {
-        drive_request(
-            &recorder,
-            &foreign,
-            &stages,
-            foreign_stage,
-            &mut model,
-            request,
-        );
+    for (owner, (recorder, stages)) in registries.iter().enumerate() {
+        assert_snapshot(&recorder.snapshot_relaxed(), stages, &models[owner]);
     }
-    assert_snapshot(&recorder.snapshot_relaxed(), &stages, &model);
-
-    let mut stale_actual = recorder.start_manual();
-    let mut stale_model = ContextModel::default();
-    recorder.record_elapsed(&mut stale_actual, stages[0], Duration::from_nanos(101));
-    model.mark(
-        &mut stale_model,
-        false,
-        MarkStage::Registered(0),
-        Duration::from_nanos(101),
-        None,
-    );
-    recorder.try_freeze_calibration(1).unwrap();
-    model.freeze();
-    recorder.finish_manual(
-        stale_actual,
-        stages[1],
-        Duration::from_nanos(202),
-        Outcome::Error,
-    );
-    model.mark(
-        &mut stale_model,
-        false,
-        MarkStage::Registered(1),
-        Duration::from_nanos(202),
-        Some(Outcome::Error),
-    );
-    for request in after {
-        drive_request(
-            &recorder,
-            &foreign,
-            &stages,
-            foreign_stage,
-            &mut model,
-            request,
-        );
+    // Later writes and delta/diagnosis calls must not mutate retained snapshots.
+    for (owner, snapshot, model) in history {
+        assert_snapshot(&snapshot, &registries[owner].1, &model);
     }
-    assert_snapshot(&recorder.snapshot_relaxed(), &stages, &model);
 }
 
 #[test]
@@ -558,28 +875,75 @@ fn predecessor_online_sample_without_frozen_threshold_is_skipped() {
 }
 
 #[test]
+fn recorder_sequences_retry_terminal_freezes_at_one_and_sixty_four_stages() {
+    for stages in [1, 64] {
+        for terminal in [DurationSpec::Small(50), DurationSpec::Max] {
+            let mut ops = vec![Operation::Snapshot(0), Operation::TryFreeze(0, 0)];
+            for stage in 0..stages {
+                ops.extend([
+                    Operation::Start(0, 0),
+                    Operation::Finish(0, 0, MarkStage::Registered(stage), terminal, false),
+                ]);
+            }
+            ops.extend([
+                Operation::TryFreeze(0, 1),
+                Operation::Snapshot(0),
+                Operation::Start(1, 0),
+            ]);
+            // Two finite samples move the median off either terminal.
+            for _ in 0..2 {
+                ops.push(Operation::Start(0, 0));
+                for stage in 0..stages {
+                    ops.push(Operation::Mark(
+                        0,
+                        0,
+                        MarkStage::Registered(stage),
+                        DurationSpec::Small(200),
+                    ));
+                }
+            }
+            ops.extend([
+                Operation::TryFreeze(0, 2),
+                Operation::TryFreeze(0, 0),
+                Operation::Finish(
+                    1,
+                    0,
+                    MarkStage::Registered(stages - 1),
+                    DurationSpec::Small(300),
+                    true,
+                ),
+                Operation::Start(2, 0),
+                Operation::Finish(
+                    2,
+                    0,
+                    MarkStage::Registered(stages - 1),
+                    DurationSpec::Small(900),
+                    false,
+                ),
+                Operation::Snapshot(0),
+                Operation::Delta(2, 0),
+                Operation::Delta(2, 1),
+                Operation::Delta(0, 2),
+            ]);
+            run_case(stages, 0.5, &ops);
+        }
+    }
+}
+
+#[test]
 fn recorder_state_machine_matches_independent_model() {
-    let config = Config {
-        cases: 96,
-        failure_persistence: Some(Box::new(
-            proptest::test_runner::FileFailurePersistence::Direct(
-                "proptest-regressions/it/properties.txt",
-            ),
-        )),
-        ..Config::default()
-    };
-    let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[0xa5; 32]);
-    let mut runner = TestRunner::new_with_rng(config, rng);
+    let mut runner = support::runner(96, 0xa5, "proptest-regressions/it/properties.txt");
+    let strategy = (
+        prop::sample::select(vec![1_u8, 2, 3, 8]),
+        support::quantiles(),
+    )
+        .prop_flat_map(|(stages, quantile)| {
+            (Just(stages), Just(quantile), sequence_strategy(stages))
+        });
     runner
-        .run(
-            &(
-                prop::collection::vec(request_strategy(), 0..=15),
-                prop::collection::vec(request_strategy(), 1..=15),
-            ),
-            |(before, after)| {
-                run_case(&before, &after);
-                Ok(())
-            },
-        )
+        .run(&strategy, |(stages, quantile, ops)| {
+            run_case(stages, quantile, &ops);
+            Ok(())
+        })
         .unwrap();
 }

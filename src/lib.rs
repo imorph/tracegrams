@@ -74,6 +74,10 @@ mod init;
 mod recorder;
 mod snapshot;
 
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 pub use bucket::{BucketThreshold, CalibrationEstimate, CalibrationTerminal};
 pub use calibration::{
     CalibrationPopulationReport, CalibrationThresholdAvailability, FreezeError, FreezeReport,

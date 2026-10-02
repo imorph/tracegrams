@@ -615,6 +615,7 @@ mod tests {
     use super::*;
     use crate::bucket::{BUCKETS, CALIBRATION_BUCKETS, bucketize};
     use crate::recorder::{Segment, StorageLayout};
+    use proptest::prelude::*;
 
     fn two_stage_recorder() -> (Tracegrams, StageId, StageId) {
         let mut builder = Tracegrams::builder();
@@ -821,6 +822,107 @@ mod tests {
 
         assert_eq!(raw_counters(&clocked), raw_counters(&manual));
         assert_test_clock_consumed(&clocked, 3);
+    }
+
+    #[test]
+    fn clocked_sequences_match_manual_across_freeze() {
+        let mut runner = crate::test_support::runner(96, 0xc7, "proptest-regressions/context.txt");
+        let operations = prop::collection::vec(
+            (0..4_usize, 100..20_000_u64, any::<bool>(), any::<bool>()),
+            1..=32,
+        );
+        runner
+            .run(
+                &(crate::test_support::quantiles(), 0..=32_usize, operations),
+                |(quantile, freeze_at, operations)| {
+                    let pairs = [(); 2].map(|()| {
+                        let mut builder = Tracegrams::builder();
+                        builder.tail_quantile(quantile).unwrap();
+                        let stages = [
+                            builder.stage("first").unwrap(),
+                            builder.stage("second").unwrap(),
+                        ];
+                        let recorder = builder.build().unwrap();
+                        let mut warmup = recorder.start_manual();
+                        recorder.record_elapsed(&mut warmup, stages[0], Duration::from_nanos(100));
+                        recorder.finish_manual(
+                            warmup,
+                            stages[1],
+                            Duration::from_nanos(200),
+                            Outcome::Success,
+                        );
+                        (recorder, stages)
+                    });
+                    let [(clocked, clock_stages), (manual, manual_stages)] = pairs;
+                    let mut now = 1_000;
+                    let mut reads = 0;
+                    let mut contexts: [Option<(Ctx, ManualCtx, u64, bool)>; 4] =
+                        std::array::from_fn(|_| {
+                            clocked
+                                .inner
+                                .clock_readings
+                                .lock()
+                                .unwrap()
+                                .push_back((now, false));
+                            reads += 1;
+                            Some((clocked.start(), manual.start_manual(), now, false))
+                        });
+                    let freeze_at = freeze_at % (operations.len() + 1);
+                    for index in 0..=operations.len() {
+                        if index == freeze_at {
+                            clocked.try_freeze_calibration(1).unwrap();
+                            manual.try_freeze_calibration(1).unwrap();
+                        }
+                        let Some(&(slot, tick, restart, finish)) = operations.get(index) else {
+                            break;
+                        };
+                        if restart {
+                            contexts[slot] = None;
+                        }
+                        if contexts[slot].is_none() {
+                            clocked
+                                .inner
+                                .clock_readings
+                                .lock()
+                                .unwrap()
+                                .push_back((now, false));
+                            reads += 1;
+                            contexts[slot] =
+                                Some((clocked.start(), manual.start_manual(), now, false));
+                        }
+                        now += tick;
+                        clocked
+                            .inner
+                            .clock_readings
+                            .lock()
+                            .unwrap()
+                            .push_back((now, false));
+                        reads += 1;
+                        let (mut actual, mut expected, previous_time, has_previous) =
+                            contexts[slot].take().unwrap();
+                        let stage = usize::from(has_previous);
+                        let elapsed = Duration::from_nanos(now - previous_time);
+                        if has_previous || finish {
+                            clocked.finish(actual, clock_stages[stage], Outcome::Error);
+                            manual.finish_manual(
+                                expected,
+                                manual_stages[stage],
+                                elapsed,
+                                Outcome::Error,
+                            );
+                        } else {
+                            clocked.mark(&mut actual, clock_stages[stage]);
+                            manual.record_elapsed(&mut expected, manual_stages[stage], elapsed);
+                            contexts[slot] = Some((actual, expected, now, true));
+                        }
+                        prop_assert_eq!(raw_counters(&clocked), raw_counters(&manual));
+                    }
+                    prop_assert_eq!(raw_counters(&clocked), raw_counters(&manual));
+                    assert_test_clock_consumed(&clocked, reads);
+                    Ok(())
+                },
+            )
+            .unwrap();
     }
 
     #[test]

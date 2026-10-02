@@ -13,3 +13,6 @@ mod init;
 mod manual_recording;
 mod properties;
 mod snapshot_delta;
+
+#[path = "../support/mod.rs"]
+mod support;
