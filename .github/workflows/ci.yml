@@ -55,6 +55,8 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
+      # Mutations can leave unused code; tests, not warning denial, must catch them.
+      RUSTFLAGS: ""
       BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
