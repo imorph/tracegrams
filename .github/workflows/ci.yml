@@ -50,6 +50,40 @@ jobs:
       - run: cargo test --locked --all-features --release --test it recorder_state_machine_matches_independent_model
       - run: cargo test --locked --all-features --release --test it diagnosis_scores_match_raw_event_oracle
 
+  mutants-diff:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
+        with: { toolchain: stable }
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # tag=v2.87.1
+        with: { tool: cargo-mutants }
+      - name: Diff changed lines
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          elif [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            base="$(git hash-object -t tree /dev/null)"
+          else
+            base="$BASE_SHA"
+          fi
+          git diff --no-ext-diff --no-color --no-renames --unified=0 "$base" "$HEAD_SHA" -- > git.diff
+      - run: cargo mutants --in-diff git.diff --in-place
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # tag=v7.0.0
+        if: always()
+        with:
+          name: mutants-diff
+          path: mutants.out
+
   fmt:
     runs-on: ubuntu-latest
     steps:

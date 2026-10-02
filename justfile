@@ -12,7 +12,7 @@ default:
 setup:
     rustup toolchain install nightly
     rustup toolchain install {{ msrv }}
-    cargo install --locked cargo-docs-rs cargo-deny zizmor
+    cargo install --locked cargo-docs-rs cargo-deny cargo-mutants zizmor
 
 # Apply formatting.
 fmt:
@@ -30,6 +30,20 @@ clippy:
 test:
     cargo test --locked --all-features --all-targets
     cargo test --locked --all-features --doc
+
+# Run all mutation tests; deliberately separate from test and all.
+mutants:
+    cargo mutants
+
+# Mutate changes since the common ancestor with origin/main, including local edits.
+[unix]
+mutants-diff:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    diff_file="$(mktemp)"
+    trap 'rm -f "$diff_file"' EXIT
+    git diff --no-ext-diff --no-color --no-renames --unified=0 "$(git merge-base origin/main HEAD)" -- > "$diff_file"
+    cargo mutants --in-diff "$diff_file"
 
 # Build and verify the packaged crate.
 package-check:

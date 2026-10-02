@@ -1,0 +1,28 @@
+# Match mutation descriptions, not line numbers, so source edits do not move exclusions.
+exclude_re = [
+  # Three disjoint metadata fields: OR and XOR are equivalent after IDENTITY_MASK.
+  'replace \| with \^ in Ctx::set_previous$',
+  # The mantissa is below bit 52, so OR and XOR set the implicit bit identically.
+  'replace \| with \^ in quantile_rank$',
+  # Strictly increasing bucket bounds make lower == upper unreachable.
+  'replace < with <= in relative_error$',
+  # The fallback already sets every score to NoPredecessorPopulation.
+  # cargo-mutants 27.1.0 ignores this field-deletion filter (upstream #632):
+  # https://github.com/sourcefrog/cargo-mutants/issues/632
+  # Keep the narrow rule for the fix; do not exclude the whole function.
+  'delete field tail_onset from struct Scores expression in derive_matrix_scores$',
+  # For predecessor cells c >= 4, (c - 4) & 4 == (c + 4) & 4.
+  'replace - with \+ in online_totals$',
+  # Complementing both frozen predicates preserves their inequality.
+  'replace == with != in Snapshot::delta$',
+  # A matching registry cookie guarantees the opaque stage index is below len.
+  'replace < with <= in Snapshot::stage_index$',
+  # Context Debug output is not a public contract.
+  '<impl fmt::Debug for Ctx>::fmt ->',
+  # Manual-context Debug output is not a public contract.
+  '<impl fmt::Debug for ManualCtx>::fmt ->',
+  # Recorder Debug output is not a public contract; StageId Debug remains tested.
+  '<impl fmt::Debug for Tracegrams>::fmt ->',
+  # The sole multiplication here estimates Arc's private header, not fixed counter storage.
+  'replace \* with (\+|/) in estimate_memory$',
+]

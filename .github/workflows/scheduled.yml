@@ -39,6 +39,22 @@ jobs:
         with: { tool: just }
       - run: just test-latest-deps
 
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
+        with: { toolchain: stable }
+      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # tag=v2.87.1
+        with: { tool: cargo-mutants }
+      - run: cargo mutants --in-place
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # tag=v7.0.0
+        if: always()
+        with:
+          name: mutants-full
+          path: mutants.out
+
   advisories:
     runs-on: ubuntu-latest
     steps:
