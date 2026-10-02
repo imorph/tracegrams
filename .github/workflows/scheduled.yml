@@ -24,7 +24,7 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
         with: { toolchain: nightly }
-      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # tag=v2.87.1
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # tag=v2.87.22
         with: { tool: just }
       - run: just test
 
@@ -61,7 +61,7 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
         with: { toolchain: stable }
-      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # tag=v2.87.1
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # tag=v2.87.22
         with: { tool: just }
       - run: just test-latest-deps
 
@@ -72,7 +72,7 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
         with: { toolchain: stable }
-      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # tag=v2.87.1
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # tag=v2.87.22
         with: { tool: cargo-mutants }
       - run: cargo mutants --in-place
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # tag=v7.0.0
@@ -88,6 +88,6 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # tag=v1
         with: { toolchain: stable }
-      - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # tag=v2.87.1
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # tag=v2.87.22
         with: { tool: "just,cargo-deny" }
       - run: just deny-advisories
