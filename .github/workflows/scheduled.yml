@@ -48,7 +48,7 @@ jobs:
         env: { TRACEGRAMS_PROPTEST_CASES: "960" }
       - run: cargo test --locked --all-features --release --lib nearest_rank_matches_exact_rational_oracle_and_is_monotonic -- --nocapture
         env: { TRACEGRAMS_PROPTEST_CASES: "2560" }
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # tag=v7.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # tag=v7.0.2
         if: always()
         with:
           name: property-regressions
@@ -78,7 +78,7 @@ jobs:
       - uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # tag=v2.87.1
         with: { tool: cargo-mutants }
       - run: cargo mutants --in-place
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # tag=v7.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # tag=v7.0.2
         if: always()
         with:
           name: mutants-full
